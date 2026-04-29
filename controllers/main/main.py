@@ -1,4 +1,5 @@
 # Main simulation file called by the Webots
+import os
 import sys
 print("You are using python at this location:", sys.executable)
 
@@ -17,6 +18,12 @@ import threading
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
 control_style = 'path_planner'      # 'keyboard' or 'path_planner'
 rand_env = True                # Randomise the environment
+
+# Local debug knobs for batch/fast CLI iteration. These are ignored by the
+# official submission path, which only evaluates my_assignment.py and
+# ex1_pid_control.py.
+debug_max_time = float(os.environ.get("MICRO502_MAX_TIME", "245") or 0)
+debug_sync_assignment = os.environ.get("MICRO502_SYNC_ASSIGNMENT", "1") != "0"
 
 # Global variables for handling threads
 latest_sensor_data = None
@@ -672,7 +679,8 @@ if __name__ == '__main__':
     assert exp_num in [0,1,2,3,4], "Exp_num must be a value between 0 and 4"
 
     # Start the path planner thread
-    if control_style == 'path_planner' and exp_num == 4:
+    planner_thread = None
+    if control_style == 'path_planner' and exp_num == 4 and not debug_sync_assignment:
         planner_thread = threading.Thread(target=path_planner_thread, args=(drone,))
         planner_thread.daemon = True
         planner_thread.start()
@@ -724,10 +732,14 @@ if __name__ == '__main__':
                         # Read the camera feed
                         camera_data = drone.read_camera()
                         
-                        # Update the sensor data in the thread
-                        with sensor_lock:
+                        if debug_sync_assignment:
+                            current_setpoint = assignment.get_command(sensor_data.copy(), camera_data.copy(), drone.dt_ctrl)
                             latest_sensor_data = sensor_data
-                            latest_camera_data = camera_data
+                        else:
+                            # Update the sensor data in the thread
+                            with sensor_lock:
+                                latest_sensor_data = sensor_data
+                                latest_camera_data = camera_data
 
                         # Call the PID controller to get the motor commands
                         motorPower = drone.PID_CF.setpoint_to_pwm(drone.dt_ctrl, current_setpoint, latest_sensor_data)
@@ -738,7 +750,15 @@ if __name__ == '__main__':
                     running = drone.track_assignment_progress(sensor_data)
                     
                     # If the drone has completed the assignment, crash the drone
-                    if not running:    
+                    if not running:
+                        print("DEBUG_FINISHED",
+                              "t=", round(drone.getTime(), 3),
+                              "lap=", drone.lap,
+                              "segment=", drone.segment,
+                              "lap_times=", drone.lap_times,
+                              "gate_progress=", drone.gate_progress,
+                              flush=True)
+                        drone.simulationQuit(0)
                         break
 
                 # Update the PID control time
@@ -747,10 +767,23 @@ if __name__ == '__main__':
 
             # Update the drone status in simulation
             drone.step(motorPower, sensor_data)
+
+            if debug_max_time and exp_num == 4 and drone.getTime() >= debug_max_time:
+                print("DEBUG_TIMEOUT",
+                      "t=", round(drone.getTime(), 3),
+                      "lap=", drone.lap,
+                      "segment=", drone.segment,
+                      "lap_times=", drone.lap_times,
+                      "gate_progress=", drone.gate_progress,
+                      flush=True)
+                running = False
+                drone.simulationQuit(0)
+                break
     
     except KeyboardInterrupt:
         running = False
-        planner_thread.join()
+        if planner_thread is not None:
+            planner_thread.join()
 
 
 

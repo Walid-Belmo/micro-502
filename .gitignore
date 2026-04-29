@@ -138,3 +138,6 @@ dmypy.json
 # Occupancy map
 map.png
 
+# Local controller debug output
+controllers/main/assignment/debug/
+
