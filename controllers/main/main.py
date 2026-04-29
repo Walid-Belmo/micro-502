@@ -24,6 +24,7 @@ rand_env = True                # Randomise the environment
 # ex1_pid_control.py.
 debug_max_time = float(os.environ.get("MICRO502_MAX_TIME", "245") or 0)
 debug_sync_assignment = os.environ.get("MICRO502_SYNC_ASSIGNMENT", "1") != "0"
+debug_assignment_dir = os.path.join(os.path.dirname(__file__), "assignment", "debug")
 
 # Global variables for handling threads
 latest_sensor_data = None
@@ -190,6 +191,22 @@ class CrazyflieInDroneDome(Supervisor):
                 self.gate_positions.append(goal_node.getField('translation').getSFVec3f())
                 self.gate_sizes.append(goal_node.getField('goalSize').getSFVec3f())
                 self.gate_orientations.append(goal_node.getField('rotation').getSFRotation())
+            self.score_log_path = os.path.join(debug_assignment_dir, "sim_progress.log")
+            os.makedirs(os.path.dirname(self.score_log_path), exist_ok=True)
+            with open(self.score_log_path, "w", encoding="utf-8") as score_log:
+                score_log.write("Webots simulator scoring log\n")
+            self.log_score("init")
+
+    def log_score(self, event):
+        if exp_num != 4 or not hasattr(self, "score_log_path"):
+            return
+        with open(self.score_log_path, "a", encoding="utf-8") as score_log:
+            score_log.write(
+                f"[{self.getTime():8.3f}] {event} "
+                f"lap={self.lap} segment={self.segment} "
+                f"lap_times={self.lap_times} "
+                f"gate_progress={self.gate_progress}\n"
+            )
 
     # Randomise the positions of the drone, obstacles, goal, take-off pad and landing pad
     def randomise_positions(self):
@@ -317,6 +334,7 @@ class CrazyflieInDroneDome(Supervisor):
             drone.lap_times[drone.lap] = elapsed_time
             drone.lap += 1
             print(f"Lap completed. Total time elapsed: {elapsed_time:.2f} seconds") 
+            drone.log_score("lap_complete")
             drone.segment_progress = [False] * drone.num_segments
             drone.segment = 0
         
@@ -343,6 +361,7 @@ class CrazyflieInDroneDome(Supervisor):
         if drone.lap == drone.num_laps:
             print("Lap times:", drone.lap_times)
             print("Gate progress:", drone.gate_progress)
+            drone.log_score("finished")
             return False
         
         return True
@@ -612,6 +631,7 @@ class CrazyflieInDroneDome(Supervisor):
                 goal_visibility = goal_node.getField('goalVisible')
                 goal_visibility.setSFFloat(1.0)
                 self.gate_progress[self.lap][gate_idx] = True
+                self.log_score(f"gate_reached gate={gate_idx}")
 
     def reset(self):
         # Reset the simulation
@@ -758,6 +778,7 @@ if __name__ == '__main__':
                               "lap_times=", drone.lap_times,
                               "gate_progress=", drone.gate_progress,
                               flush=True)
+                        drone.log_score("debug_finished")
                         drone.simulationQuit(0)
                         break
 
@@ -769,6 +790,7 @@ if __name__ == '__main__':
             drone.step(motorPower, sensor_data)
 
             if debug_max_time and exp_num == 4 and drone.getTime() >= debug_max_time:
+                drone.log_score("debug_timeout")
                 print("DEBUG_TIMEOUT",
                       "t=", round(drone.getTime(), 3),
                       "lap=", drone.lap,

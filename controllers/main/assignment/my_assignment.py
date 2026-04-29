@@ -324,7 +324,7 @@ class MyAssignment:
         self.stage = "pass"
         self.pass_stage = "center"
         self.commit_gate_idx = self.gate_idx
-        self.commit_until = now + 3.0
+        self.commit_until = now + 8.0
         self.pass_started_at = now
         self.commit_target = exit_point
         self._log(
@@ -363,9 +363,9 @@ class MyAssignment:
                 and now - self.pass_started_at > 0.35
                 and abs(detection["err_x"]) < 0.18
                 and abs(detection["err_y"]) < 0.22
-                and detection["area"] > 1500
+                and detection["area"] > 4200
             )
-            timed_out = now > self.commit_until - 1.0 and center_error < 0.34
+            timed_out = now > self.commit_until - 1.0 and center_error < 0.28
             if center_error < 0.21 or visually_centered or timed_out:
                 self._log(f"pass_center_reached lap=0 gate={gate_idx} err={center_error:.2f}")
                 self.pass_stage = "exit"
@@ -374,7 +374,8 @@ class MyAssignment:
 
         self.stage = "pass_exit"
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
-        if progress > 0.45 or np.linalg.norm(pos - exit_point) < 0.22 or now > self.commit_until:
+        exit_error = np.linalg.norm(pos - exit_point)
+        if progress > 0.45 or (exit_error < 0.22 and progress > 0.20):
             self._log(f"pass_done lap=0 gate={gate_idx} progress={progress:.2f}")
             self.gate_idx += 1
             self.stage = "search"
@@ -382,6 +383,18 @@ class MyAssignment:
             self.commit_gate_idx = None
             self.commit_target = None
             return self._search_command(now, pos, self.gate_idx)
+
+        if now > self.commit_until and progress < -0.15:
+            self._log(
+                f"pass_retry_same_gate lap=0 gate={gate_idx} "
+                f"progress={progress:.2f} exit_err={exit_error:.2f}"
+            )
+            self.stage = "vision_servo"
+            self.pass_stage = "center"
+            self.commit_gate_idx = None
+            self.commit_target = None
+            self.commit_until = 0.0
+            return self._vision_servo_command(pos, pass_yaw, detection) if detection is not None else self._search_command(now, pos, gate_idx)
 
         return self._limited_setpoint(pos, exit_point, max_step=0.34, yaw_target=pass_yaw)
 
