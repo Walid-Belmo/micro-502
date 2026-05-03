@@ -44,6 +44,8 @@ class MyAssignment:
 
         self.gate_estimates = [None] * self.num_gates
         self.gate_pass_directions = [None] * self.num_gates
+        self.gate_pass_direction_sources = ["none"] * self.num_gates
+        self.gate_pass_direction_confidence = [0.0] * self.num_gates
         self.estimate_samples = [0] * self.num_gates
         self.ray_observations = [[] for _ in range(self.num_gates)]
 
@@ -479,6 +481,22 @@ class MyAssignment:
             )
             return False
 
+        right = np.array([-pass_dir[1], pass_dir[0]])
+        lateral_error = abs(float(np.dot(pos[:2] - gate[:2], right[:2])))
+        before_gate = -progress
+        near_center_line = np.linalg.norm(pos[:2] - gate[:2]) < 0.38 and lateral_error < 0.28
+        lined_up_for_gate_plane = (0.20 <= before_gate <= 0.95 and lateral_error < 0.34) or near_center_line
+        if not lined_up_for_gate_plane:
+            self._log_throttled(
+                f"commit_not_ready_not_aligned_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=not_aligned "
+                f"before_gate={before_gate:.2f} lateral={lateral_error:.2f} "
+                f"gate={self._vec(gate)} dir={self._vec(pass_dir)} det={self._det_summary(detection)}",
+            )
+            return False
+
         err_x = abs(detection["err_x"])
         err_y = abs(detection["err_y"])
         area = detection["area"]
@@ -530,6 +548,7 @@ class MyAssignment:
             gate = self._sanitize_gate_estimate(self.gate_idx, gate)
 
         if gate is not None:
+            self._update_pass_direction_from_detection(self.gate_idx, sensor_data, detection, image_shape, gate)
             pass_dir = self._learn_pass_direction(self.gate_idx, gate, pos)
         else:
             self._log(f"commit_blocked_no_valid_estimate gate={self.gate_idx}")
@@ -668,13 +687,26 @@ class MyAssignment:
         mono, mono_reason = self._sanitize_gate_estimate_with_reason(gate_idx, mono_raw)
         tri_raw = self._triangulate_rays(observations)
         tri, tri_reason = self._sanitize_gate_estimate_with_reason(gate_idx, tri_raw)
+        old = self.gate_estimates[gate_idx]
         candidate = mono
         source = "monocular"
         if mono is not None and tri is not None:
             disagreement = np.linalg.norm(mono[:2] - tri[:2])
-            if disagreement <= 0.35:
-                candidate = 0.65 * mono + 0.35 * tri
+            if disagreement <= 0.24:
+                candidate = 0.55 * mono + 0.45 * tri
                 source = "mono_tri_agree"
+            elif len(observations) >= 3 and (
+                old is None or np.linalg.norm(tri[:2] - old[:2]) <= np.linalg.norm(mono[:2] - old[:2]) + 0.08
+            ):
+                candidate = tri
+                source = "triangulated_disagreement"
+                self._log_throttled(
+                    f"estimate_prefer_triangulation_{gate_idx}",
+                    now,
+                    0.5,
+                    f"estimate_prefer_triangulation gate={gate_idx} disagreement={disagreement:.2f} "
+                    f"mono={self._vec(mono)} tri={self._vec(tri)}",
+                )
             else:
                 self._log_throttled(
                     f"estimate_ignore_triangulation_{gate_idx}",
@@ -696,7 +728,6 @@ class MyAssignment:
             )
             return
 
-        old = self.gate_estimates[gate_idx]
         if old is None:
             estimate = candidate
         elif np.linalg.norm(old[:2] - candidate[:2]) > 0.80:
@@ -710,6 +741,7 @@ class MyAssignment:
         estimate[2] = np.clip(estimate[2], 0.70, 2.05)
         self.gate_estimates[gate_idx] = estimate
         self.estimate_samples[gate_idx] += 1
+        self._update_pass_direction_from_detection(gate_idx, sensor_data, detection, image_shape, estimate)
         self._log(
             f"estimate_accept gate={gate_idx} source={source} samples={self.estimate_samples[gate_idx]} "
             f"estimate={self._vec(estimate)} candidate={self._vec(candidate)} mono_reason={mono_reason} tri_reason={tri_reason}"
@@ -753,6 +785,7 @@ class MyAssignment:
 
         corrected = visual_gate.copy()
         self.gate_estimates[self.gate_idx] = corrected
+        self._update_pass_direction_from_detection(self.gate_idx, sensor_data, detection, image_shape, corrected)
         self._learn_pass_direction(self.gate_idx, corrected, pos)
         self._log(
             f"stored_visual_correction lap={self.route_lap} gate={self.gate_idx} "
@@ -849,6 +882,7 @@ class MyAssignment:
             center_penalty = abs((cx - w / 2.0) / (w / 2.0))
             score = area * (0.8 + 0.2 * min(fill, 1.0)) / (1.0 + 0.15 * center_penalty)
             if best is None or score > best["score"]:
+                quad = self._quad_from_contour(contour)
                 best = {
                     "score": score,
                     "area": float(area),
@@ -858,9 +892,169 @@ class MyAssignment:
                     "err_y": float((cy - h / 2.0) / (h / 2.0)),
                     "fill": float(fill),
                     "touches_edge": bool(touches_edge),
+                    "quad": quad,
                     "mask": mask,
                 }
         return best
+
+    def _quad_from_contour(self, contour):
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 1e-6:
+            return None
+
+        hull = cv2.convexHull(contour)
+        approx = cv2.approxPolyDP(hull, 0.035 * perimeter, True)
+        if len(approx) == 4:
+            points = approx.reshape(4, 2).astype(np.float32)
+        else:
+            rect = cv2.minAreaRect(contour)
+            points = cv2.boxPoints(rect).astype(np.float32)
+
+        return tuple((float(x), float(y)) for x, y in self._order_image_quad(points))
+
+    def _order_image_quad(self, points):
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if points.shape[0] != 4:
+            return points
+
+        by_y = points[np.argsort(points[:, 1])]
+        top = by_y[:2][np.argsort(by_y[:2, 0])]
+        bottom = by_y[2:][np.argsort(by_y[2:, 0])]
+        return np.array([top[0], top[1], bottom[1], bottom[0]], dtype=np.float32)
+
+    def _update_pass_direction_from_detection(self, gate_idx, sensor_data, detection, image_shape, gate_estimate):
+        direction, reason, confidence = self._visual_pass_direction(gate_idx, sensor_data, detection, image_shape, gate_estimate)
+        if direction is None:
+            self._log_throttled(
+                f"visual_pass_direction_skip_{gate_idx}_{reason.split()[0]}",
+                float(sensor_data.get("t", 0.0)),
+                0.75,
+                f"visual_pass_direction_skip gate={gate_idx} reason={reason} det={self._det_summary(detection)}",
+            )
+            return False
+
+        old = self.gate_pass_directions[gate_idx]
+        old_conf = self.gate_pass_direction_confidence[gate_idx]
+        if old is None or self.gate_pass_direction_sources[gate_idx] != "vision_pose":
+            fused = direction
+        elif np.dot(old[:2], direction[:2]) <= 0.35:
+            self._log(
+                f"visual_pass_direction_reject gate={gate_idx} reason=disagrees_with_stored "
+                f"old={self._vec(old)} candidate={self._vec(direction)} confidence={confidence:.2f}"
+            )
+            return False
+        else:
+            old_weight = max(old_conf, 0.35)
+            new_weight = max(confidence, 0.35)
+            fused = old_weight * old + new_weight * direction
+            norm = np.linalg.norm(fused[:2])
+            if norm < 1e-9:
+                return False
+            fused = fused / norm
+
+        self.gate_pass_directions[gate_idx] = fused.copy()
+        self.gate_pass_direction_sources[gate_idx] = "vision_pose"
+        self.gate_pass_direction_confidence[gate_idx] = max(old_conf, confidence)
+        self._log(
+            f"visual_pass_direction_accept gate={gate_idx} confidence={confidence:.2f} "
+            f"reason={reason} direction={self._vec(fused)} gate={self._vec(gate_estimate)} "
+            f"det={self._det_summary(detection)}"
+        )
+        return True
+
+    def _visual_pass_direction(self, gate_idx, sensor_data, detection, image_shape, gate_estimate):
+        if not self._is_full_gate_detection(detection):
+            return None, "not_full_detection", 0.0
+        quad = detection.get("quad")
+        if quad is None:
+            return None, "missing_quad", 0.0
+
+        image_points = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+        if not np.all(np.isfinite(image_points)):
+            return None, "nonfinite_quad", 0.0
+
+        quad_area = abs(cv2.contourArea(image_points.reshape(-1, 1, 2)))
+        if quad_area < 300.0:
+            return None, f"quad_too_small area={quad_area:.1f}", 0.0
+
+        height = float(image_shape[0])
+        width = float(image_shape[1])
+        f_pixels = width / (2.0 * math.tan(self.camera_fov / 2.0))
+        camera_matrix = np.array(
+            [
+                [f_pixels, 0.0, width / 2.0],
+                [0.0, f_pixels, height / 2.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+        gate_width = self._estimated_gate_width_from_detection(detection)
+        half_width = 0.5 * gate_width
+        half_height = 0.5 * self.opening_height
+        object_points = np.array(
+            [
+                [0.0, half_width, half_height],
+                [0.0, -half_width, half_height],
+                [0.0, -half_width, -half_height],
+                [0.0, half_width, -half_height],
+            ],
+            dtype=np.float64,
+        )
+
+        ok, rvec, tvec = cv2.solvePnP(
+            object_points,
+            image_points.astype(np.float64),
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            return None, "solvepnp_failed", 0.0
+
+        projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+        projected = projected.reshape(-1, 2)
+        reproj_error = float(np.mean(np.linalg.norm(projected - image_points, axis=1)))
+        if reproj_error > 22.0:
+            return None, f"reprojection_error={reproj_error:.1f}", 0.0
+
+        rotation_obj_to_camera, _ = cv2.Rodrigues(rvec)
+        normal_camera = rotation_obj_to_camera[:, 0]
+        normal_body = np.array([normal_camera[2], -normal_camera[0], -normal_camera[1]], dtype=float)
+        rotation_body_to_world = self._rotation_body_to_world(sensor_data)
+        normal_world = rotation_body_to_world @ normal_body
+        normal_world[2] = 0.0
+        norm = np.linalg.norm(normal_world[:2])
+        if norm < 1e-9:
+            return None, "horizontal_normal_degenerate", 0.0
+        direction = normal_world / norm
+
+        tangent = self._geometric_pass_direction_for_gate(gate_idx, gate_estimate)
+        if np.dot(direction[:2], tangent[:2]) < 0.0:
+            direction = -direction
+        tangent_alignment = float(np.dot(direction[:2], tangent[:2]))
+        if tangent_alignment < math.cos(math.radians(55.0)):
+            return None, f"too_far_from_nominal align={tangent_alignment:.2f}", 0.0
+
+        confidence = float(np.clip((quad_area / 1200.0) * (22.0 - reproj_error) / 22.0, 0.15, 1.0))
+        reason = f"pose_from_quad width={gate_width:.2f} reproj={reproj_error:.1f} align={tangent_alignment:.2f}"
+        return direction, reason, confidence
+
+    def _estimated_gate_width_from_detection(self, detection):
+        quad = detection.get("quad")
+        if quad is None:
+            return self.assumed_gate_width
+
+        pts = np.asarray(quad, dtype=float).reshape(4, 2)
+        top_width = np.linalg.norm(pts[1] - pts[0])
+        bottom_width = np.linalg.norm(pts[2] - pts[3])
+        left_height = np.linalg.norm(pts[3] - pts[0])
+        right_height = np.linalg.norm(pts[2] - pts[1])
+        pixel_height = max(0.5 * (left_height + right_height), 1.0)
+        pixel_width = 0.5 * (top_width + bottom_width)
+        width = self.opening_height * pixel_width / pixel_height
+        return float(np.clip(width, 0.30, 0.50))
 
     def _camera_ray(self, sensor_data, detection, image_shape):
         h = float(image_shape[0])
@@ -1031,38 +1225,27 @@ class MyAssignment:
         if learned is not None:
             return learned.copy()
 
-        tangent = self._geometric_pass_direction_for_gate(gate_idx, gate_estimate)
-        if gate_estimate is not None and pos is not None:
-            to_gate = np.asarray(gate_estimate)[:2] - np.asarray(pos)[:2]
-            norm = np.linalg.norm(to_gate)
-            if norm > 1e-6:
-                approach = np.array([to_gate[0] / norm, to_gate[1] / norm, 0.0])
-                if np.dot(approach[:2], tangent[:2]) > 0.35:
-                    return approach
-
-        return tangent
+        return self._geometric_pass_direction_for_gate(gate_idx, gate_estimate)
 
     def _learn_pass_direction(self, gate_idx, gate_estimate, pos):
-        tangent = self._geometric_pass_direction_for_gate(gate_idx, gate_estimate)
-        to_gate = np.asarray(gate_estimate)[:2] - np.asarray(pos)[:2]
-        norm = np.linalg.norm(to_gate)
-        source = "tangent"
-        if norm > 1e-6:
-            approach = np.array([to_gate[0] / norm, to_gate[1] / norm, 0.0])
-            if np.dot(approach[:2], tangent[:2]) > 0.35:
-                direction = approach
-                source = "approach"
-            else:
-                direction = tangent
-        else:
-            direction = tangent
-
         old = self.gate_pass_directions[gate_idx]
+        if old is not None and self.gate_pass_direction_sources[gate_idx] == "vision_pose":
+            self._log(
+                f"pass_direction_kept gate={gate_idx} source=vision_pose "
+                f"confidence={self.gate_pass_direction_confidence[gate_idx]:.2f} direction={self._vec(old)}"
+            )
+            return old.copy()
+
+        tangent = self._geometric_pass_direction_for_gate(gate_idx, gate_estimate)
+        direction = tangent
+        source = "tangent_fallback"
         if old is not None and np.dot(old[:2], direction[:2]) > 0.0:
             direction = 0.65 * old + 0.35 * direction
             direction /= np.linalg.norm(direction[:2])
 
         self.gate_pass_directions[gate_idx] = direction.copy()
+        self.gate_pass_direction_sources[gate_idx] = source
+        self.gate_pass_direction_confidence[gate_idx] = max(self.gate_pass_direction_confidence[gate_idx], 0.25)
         self._log(
             f"pass_direction_learned gate={gate_idx} source={source} "
             f"gate={self._vec(gate_estimate)} pos={self._vec(pos)} "
