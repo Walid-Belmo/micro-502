@@ -41,6 +41,10 @@ class MyAssignment:
 
         self.returning_to_start = False
         self.stored_stage = "entry"
+        self.stored_curve_key = None
+        self.stored_curve_started_at = 0.0
+        self.stored_curve_duration = 1.0
+        self.stored_curve_start = None
 
         self.gate_estimates = [None] * self.num_gates
         self.gate_pass_directions = [None] * self.num_gates
@@ -232,7 +236,7 @@ class MyAssignment:
                 self._log(f"stored_entry_reached lap={self.route_lap} gate={self.gate_idx}")
                 self.stored_stage = "center"
             else:
-                return self._limited_setpoint(pos, entry, max_step=0.52, yaw_target=pass_yaw)
+                return self._smooth_stored_setpoint(now, pos, entry, pass_yaw, ("entry", self.route_lap, self.gate_idx))
 
         if self.stored_stage == "center":
             self.stage = "stored_center"
@@ -240,7 +244,7 @@ class MyAssignment:
                 self._log(f"stored_center_reached lap={self.route_lap} gate={self.gate_idx}")
                 self.stored_stage = "exit"
             else:
-                return self._limited_setpoint(pos, center, max_step=0.24, yaw_target=pass_yaw)
+                return self._smooth_stored_setpoint(now, pos, center, pass_yaw, ("center", self.route_lap, self.gate_idx))
 
         self.stage = "stored_exit"
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
@@ -263,9 +267,10 @@ class MyAssignment:
             )
             self.gate_idx += 1
             self.stored_stage = "entry"
+            self.stored_curve_key = None
             return self._stored_lap_command(now, pos, yaw, sensor_data, detection, image_shape)
 
-        return self._limited_setpoint(pos, exit_point, max_step=0.38, yaw_target=pass_yaw)
+        return self._smooth_stored_setpoint(now, pos, exit_point, pass_yaw, ("exit", self.route_lap, self.gate_idx))
 
     def _return_to_start_or_next_lap(self, now, pos, lap_after_return):
         self.phase = "return_to_start"
@@ -277,6 +282,7 @@ class MyAssignment:
             self.gate_idx = 0
             self.stage = "search"
             self.stored_stage = "entry"
+            self.stored_curve_key = None
             self.pass_stage = "center"
             if self.route_lap > 2:
                 return self._limited_setpoint(pos, self.takeoff_pos, max_step=0.35, yaw_target=0.0)
@@ -1165,6 +1171,29 @@ class MyAssignment:
         z_delta = target[2] - pos[2]
         z_cmd = pos[2] + np.clip(z_delta, -0.22, 0.22)
         return [float(cmd_xy[0]), float(cmd_xy[1]), float(z_cmd), float(self._wrap_angle(yaw_target))]
+
+    def _smooth_stored_setpoint(self, now, pos, target, yaw_target, key):
+        target = np.asarray(target, dtype=float).copy()
+        target[0] = np.clip(target[0], 0.25, 7.75)
+        target[1] = np.clip(target[1], 0.25, 7.75)
+        target[2] = np.clip(target[2], 0.65, 2.10)
+
+        if self.stored_curve_key != key or self.stored_curve_start is None:
+            self.stored_curve_key = key
+            self.stored_curve_started_at = now
+            self.stored_curve_start = np.asarray(pos, dtype=float).copy()
+            distance = float(np.linalg.norm(target - self.stored_curve_start))
+            self.stored_curve_duration = float(np.clip(distance / 0.70, 0.85, 3.20))
+            self._log(
+                f"stored_curve_start key={key} start={self._vec(self.stored_curve_start)} "
+                f"target={self._vec(target)} duration={self.stored_curve_duration:.2f}"
+            )
+
+        elapsed = max(0.0, now - self.stored_curve_started_at)
+        s = float(np.clip(elapsed / max(self.stored_curve_duration, 1e-6), 0.0, 1.0))
+        blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+        command = self.stored_curve_start + blend * (target - self.stored_curve_start)
+        return [float(command[0]), float(command[1]), float(command[2]), float(self._wrap_angle(yaw_target))]
 
     def _position(self, sensor_data):
         return np.array(
