@@ -45,6 +45,17 @@ class MyAssignment:
         self.stored_curve_started_at = 0.0
         self.stored_curve_duration = 1.0
         self.stored_curve_start = None
+        self.stored_crossing_key = None
+        self.stored_crossing_prev_pos = None
+        self.stored_crossing_prev_progress = None
+        self.stored_crossing_logged = False
+        self.stored_motion_lap_max_speed = 0.0
+        self.stored_motion_lap_max_accel = 0.0
+        self.stored_motion_lap_max_speed_context = "none"
+        self.stored_motion_lap_max_accel_context = "none"
+        self.stored_motion_run_max_speed = 0.0
+        self.stored_motion_run_max_accel = 0.0
+        self.stored_motion_summary_lap = None
 
         self.gate_estimates = [None] * self.num_gates
         self.gate_pass_directions = [None] * self.num_gates
@@ -220,6 +231,8 @@ class MyAssignment:
         self.phase = f"stored_lap_{self.route_lap}"
 
         if self.gate_idx >= self.num_gates:
+            if self.route_lap > 0:
+                self._log_stored_motion_summary_once(self.route_lap, "all_gates_commanded")
             return self._return_to_start_or_next_lap(now, pos, lap_after_return=self.route_lap + 1)
 
         gate = self.gate_estimates[self.gate_idx]
@@ -229,6 +242,7 @@ class MyAssignment:
 
         gate = self._correct_stored_gate_from_vision(now, pos, sensor_data, detection, image_shape, gate.copy())
         entry, center, exit_point, pass_dir, pass_yaw = self._gate_waypoints(self.gate_idx, gate)
+        self._log_stored_crossing_margin(now, pos, gate, entry, center, exit_point, pass_dir)
 
         if self.stored_stage == "entry":
             self.stage = "stored_entry"
@@ -260,6 +274,16 @@ class MyAssignment:
             done_reason = "near_exit"
 
         if done_reason is not None:
+            if not self.stored_crossing_logged:
+                self._log_stored_crossing_sample(
+                    "done_before_crossing_log",
+                    self.route_lap,
+                    self.gate_idx,
+                    pos,
+                    gate,
+                    pass_dir,
+                    progress,
+                )
             self._log(
                 f"stored_gate_done lap={self.route_lap} gate={self.gate_idx} "
                 f"reason={done_reason} progress={progress:.2f} "
@@ -268,6 +292,7 @@ class MyAssignment:
             self.gate_idx += 1
             self.stored_stage = "entry"
             self.stored_curve_key = None
+            self.stored_crossing_key = None
             return self._stored_lap_command(now, pos, yaw, sensor_data, detection, image_shape)
 
         return self._smooth_stored_setpoint(now, pos, exit_point, pass_yaw, ("exit", self.route_lap, self.gate_idx))
@@ -278,11 +303,16 @@ class MyAssignment:
         segment = self._segment_from_position(pos[:2])
         if segment == 0 and np.linalg.norm(pos[:2] - self.takeoff_pos[:2]) < 0.75:
             self._log(f"own_lap_complete old_lap={self.route_lap} next_lap={lap_after_return}")
+            if self.route_lap > 0:
+                self._log_stored_motion_summary_once(self.route_lap, "lap_complete")
             self.route_lap = lap_after_return
             self.gate_idx = 0
             self.stage = "search"
             self.stored_stage = "entry"
             self.stored_curve_key = None
+            self.stored_crossing_key = None
+            self._reset_stored_motion_lap_metrics()
+            self.stored_motion_summary_lap = None
             self.pass_stage = "center"
             if self.route_lap > 2:
                 return self._limited_setpoint(pos, self.takeoff_pos, max_step=0.35, yaw_target=0.0)
@@ -1184,16 +1214,122 @@ class MyAssignment:
             self.stored_curve_start = np.asarray(pos, dtype=float).copy()
             distance = float(np.linalg.norm(target - self.stored_curve_start))
             self.stored_curve_duration = float(np.clip(distance / 0.70, 0.85, 3.20))
+            peak_speed = 1.875 * distance / max(self.stored_curve_duration, 1e-6)
+            peak_accel = (10.0 * math.sqrt(3.0) / 3.0) * distance / max(self.stored_curve_duration**2, 1e-6)
             self._log(
                 f"stored_curve_start key={key} start={self._vec(self.stored_curve_start)} "
-                f"target={self._vec(target)} duration={self.stored_curve_duration:.2f}"
+                f"target={self._vec(target)} duration={self.stored_curve_duration:.2f} "
+                f"expected_peak_speed={peak_speed:.3f} expected_peak_accel={peak_accel:.3f}"
             )
 
         elapsed = max(0.0, now - self.stored_curve_started_at)
-        s = float(np.clip(elapsed / max(self.stored_curve_duration, 1e-6), 0.0, 1.0))
+        duration = max(self.stored_curve_duration, 1e-6)
+        s = float(np.clip(elapsed / duration, 0.0, 1.0))
         blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
-        command = self.stored_curve_start + blend * (target - self.stored_curve_start)
+        delta = target - self.stored_curve_start
+        command = self.stored_curve_start + blend * delta
+        blend_rate = (30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4) / duration
+        blend_accel = (60.0 * s - 180.0 * s**2 + 120.0 * s**3) / (duration * duration)
+        speed = float(np.linalg.norm(blend_rate * delta))
+        accel = float(np.linalg.norm(blend_accel * delta))
+        self._record_stored_motion_metrics(speed, accel, key, s)
         return [float(command[0]), float(command[1]), float(command[2]), float(self._wrap_angle(yaw_target))]
+
+    def _record_stored_motion_metrics(self, speed, accel, key, s):
+        context = f"lap={self.route_lap} gate={self.gate_idx} key={key} s={s:.2f}"
+        if speed > self.stored_motion_lap_max_speed:
+            self.stored_motion_lap_max_speed = speed
+            self.stored_motion_lap_max_speed_context = context
+        if accel > self.stored_motion_lap_max_accel:
+            self.stored_motion_lap_max_accel = accel
+            self.stored_motion_lap_max_accel_context = context
+        self.stored_motion_run_max_speed = max(self.stored_motion_run_max_speed, speed)
+        self.stored_motion_run_max_accel = max(self.stored_motion_run_max_accel, accel)
+
+    def _log_stored_motion_summary(self, lap, reason):
+        self._log(
+            f"stored_motion_summary reason={reason} lap={lap} "
+            f"max_speed={self.stored_motion_lap_max_speed:.3f} "
+            f"max_accel={self.stored_motion_lap_max_accel:.3f} "
+            f"speed_context={self.stored_motion_lap_max_speed_context} "
+            f"accel_context={self.stored_motion_lap_max_accel_context} "
+            f"run_max_speed={self.stored_motion_run_max_speed:.3f} "
+            f"run_max_accel={self.stored_motion_run_max_accel:.3f}"
+        )
+
+    def _log_stored_motion_summary_once(self, lap, reason):
+        if self.stored_motion_summary_lap == lap:
+            return
+        self.stored_motion_summary_lap = lap
+        self._log_stored_motion_summary(lap, reason)
+
+    def _reset_stored_motion_lap_metrics(self):
+        self.stored_motion_lap_max_speed = 0.0
+        self.stored_motion_lap_max_accel = 0.0
+        self.stored_motion_lap_max_speed_context = "none"
+        self.stored_motion_lap_max_accel_context = "none"
+
+    def _log_stored_crossing_margin(self, now, pos, gate, entry, center, exit_point, pass_dir):
+        key = (self.route_lap, self.gate_idx)
+        progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
+        if self.stored_crossing_key != key:
+            self.stored_crossing_key = key
+            self.stored_crossing_prev_pos = None
+            self.stored_crossing_prev_progress = None
+            self.stored_crossing_logged = False
+            planned_lateral = self._gate_lateral_error(center, gate, pass_dir)
+            self._log(
+                f"stored_plan_margin lap={self.route_lap} gate={self.gate_idx} "
+                f"entry={self._vec(entry)} center={self._vec(center)} exit={self._vec(exit_point)} "
+                f"planned_lateral={planned_lateral:.3f} conservative_half_width=0.150 half_height=0.200"
+            )
+
+        if (
+            not self.stored_crossing_logged
+            and self.stored_crossing_prev_pos is not None
+            and self.stored_crossing_prev_progress is not None
+            and self.stored_crossing_prev_progress <= 0.0
+            and progress >= 0.0
+        ):
+            denom = progress - self.stored_crossing_prev_progress
+            alpha = 1.0 if abs(denom) < 1e-9 else -self.stored_crossing_prev_progress / denom
+            alpha = float(np.clip(alpha, 0.0, 1.0))
+            crossing = self.stored_crossing_prev_pos + alpha * (pos - self.stored_crossing_prev_pos)
+            self._log_stored_crossing_sample(
+                "plane_crossing",
+                self.route_lap,
+                self.gate_idx,
+                crossing,
+                gate,
+                pass_dir,
+                0.0,
+            )
+            self.stored_crossing_logged = True
+
+        self.stored_crossing_prev_pos = pos.copy()
+        self.stored_crossing_prev_progress = progress
+
+    def _log_stored_crossing_sample(self, reason, lap, gate_idx, sample_pos, gate, pass_dir, progress):
+        lateral = self._gate_lateral_error(sample_pos, gate, pass_dir)
+        vertical = float(sample_pos[2] - gate[2])
+        center_error = math.sqrt(lateral * lateral + vertical * vertical)
+        width_margin = 0.15 - abs(lateral)
+        height_margin = 0.20 - abs(vertical)
+        self._log(
+            f"stored_crossing_margin reason={reason} lap={lap} gate={gate_idx} "
+            f"sample={self._vec(sample_pos)} gate={self._vec(gate)} "
+            f"lateral_error={lateral:.3f} vertical_error={vertical:.3f} center_error={center_error:.3f} "
+            f"conservative_width_margin={width_margin:.3f} height_margin={height_margin:.3f} "
+            f"progress={progress:.3f}"
+        )
+
+    def _gate_lateral_error(self, sample_pos, gate, pass_dir):
+        right = np.array([-pass_dir[1], pass_dir[0]], dtype=float)
+        norm = np.linalg.norm(right)
+        if norm < 1e-9:
+            return 0.0
+        right /= norm
+        return float(np.dot(np.asarray(sample_pos)[:2] - np.asarray(gate)[:2], right))
 
     def _position(self, sensor_data):
         return np.array(
