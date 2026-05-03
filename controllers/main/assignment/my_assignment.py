@@ -69,6 +69,12 @@ class MyAssignment:
         self.stored_motion_run_max_speed = 0.0
         self.stored_motion_run_max_accel = 0.0
         self.stored_motion_summary_lap = None
+        self.stored_visual_correction_lap = [-1] * self.num_gates
+        self.stored_visual_min_shift = 0.12
+        self.stored_visual_max_shift = 0.55
+        self.stored_visual_blend = 0.35
+        self.stored_visual_max_progress = -0.25
+        self.stored_visual_max_center_error = 0.35
 
         self.gate_estimates = [None] * self.num_gates
         self.gate_pass_directions = [None] * self.num_gates
@@ -266,6 +272,10 @@ class MyAssignment:
 
         plan = self.stored_replay_plan
         elapsed = max(0.0, now - plan["start_time"])
+        if self._maybe_replan_stored_replay_from_vision(now, pos, sensor_data, detection, image_shape, plan, elapsed):
+            plan = self.stored_replay_plan
+            elapsed = max(0.0, now - plan["start_time"])
+
         target, velocity, acceleration = self._sample_stored_replay(plan, elapsed)
         speed = float(np.linalg.norm(velocity))
         accel = float(np.linalg.norm(acceleration))
@@ -824,9 +834,61 @@ class MyAssignment:
             return None, mono_reason
         return mono, "accepted"
 
-    def _correct_stored_gate_from_vision(self, now, pos, sensor_data, detection, image_shape, gate):
+    def _maybe_replan_stored_replay_from_vision(self, now, pos, sensor_data, detection, image_shape, plan, elapsed):
+        active = int(plan.get("active_gate", 0))
+        if active >= len(plan["gates"]):
+            return False
+
+        planned_gate = plan["gates"][active]
+        gate_idx = planned_gate["gate_idx"]
+        if self.stored_visual_correction_lap[gate_idx] == self.route_lap:
+            return False
+
+        progress = float(np.dot(pos[:2] - planned_gate["gate"][:2], planned_gate["pass_dir"][:2]))
+        if progress > self.stored_visual_max_progress:
+            self._log_throttled(
+                f"stored_visual_no_correction_late_{self.route_lap}_{gate_idx}",
+                now,
+                0.75,
+                f"stored_visual_no_correction lap={self.route_lap} gate={gate_idx} reason=too_close_or_past "
+                f"progress={progress:.2f} limit={self.stored_visual_max_progress:.2f}",
+            )
+            return False
+
+        corrected, reason = self._correct_stored_gate_from_vision(
+            now,
+            pos,
+            sensor_data,
+            detection,
+            image_shape,
+            planned_gate["gate"],
+            gate_idx,
+            planned_gate["pass_dir"],
+        )
+        if corrected is None:
+            return False
+
+        self.stored_visual_correction_lap[gate_idx] = self.route_lap
+        self.stored_replay_plan = self._build_stored_replay_plan(
+            now,
+            pos,
+            start_gate_idx=gate_idx,
+            reason=f"visual_correction:{reason}",
+        )
+        self.stored_replay_lap = self.route_lap
+        self.stored_crossing_key = None
+        self._reset_stored_motion_lap_metrics()
+        self.stored_motion_summary_lap = None
+        self._log(
+            f"stored_replay_visual_replan lap={self.route_lap} gate={gate_idx} "
+            f"reason={reason} old_plan_t={elapsed:.2f} progress={progress:.2f} "
+            f"corrected={self._vec(corrected)}"
+        )
+        return True
+
+    def _correct_stored_gate_from_vision(self, now, pos, sensor_data, detection, image_shape, gate, gate_idx, old_pass_dir):
         visual_gate, reason = self._current_visual_gate_estimate(
-            self.gate_idx,
+            gate_idx,
             sensor_data,
             detection,
             image_shape,
@@ -834,26 +896,89 @@ class MyAssignment:
         )
         if visual_gate is None:
             self._log_throttled(
-                f"stored_visual_no_correction_{self.gate_idx}",
+                f"stored_visual_no_correction_{gate_idx}",
                 now,
                 0.75,
-                f"stored_visual_no_correction lap={self.route_lap} gate={self.gate_idx} reason={reason} det={self._det_summary(detection)}",
+                f"stored_visual_no_correction lap={self.route_lap} gate={gate_idx} reason={reason} det={self._det_summary(detection)}",
             )
-            return gate
+            return None, reason
 
-        shift = np.linalg.norm(gate[:2] - visual_gate[:2])
-        if shift < 0.10:
-            return gate
+        err_x = abs(float(detection["err_x"]))
+        err_y = abs(float(detection["err_y"]))
+        if max(err_x, err_y) > self.stored_visual_max_center_error:
+            reason = f"not_centered err=({err_x:.2f},{err_y:.2f})"
+            self._log_throttled(
+                f"stored_visual_no_correction_not_centered_{gate_idx}",
+                now,
+                0.75,
+                f"stored_visual_no_correction lap={self.route_lap} gate={gate_idx} reason={reason} "
+                f"det={self._det_summary(detection)}",
+            )
+            return None, reason
 
-        corrected = visual_gate.copy()
-        self.gate_estimates[self.gate_idx] = corrected
-        self._update_pass_direction_from_detection(self.gate_idx, sensor_data, detection, image_shape, corrected)
-        self._learn_pass_direction(self.gate_idx, corrected, pos)
-        self._log(
-            f"stored_visual_correction lap={self.route_lap} gate={self.gate_idx} "
-            f"old={self._vec(gate)} visual={self._vec(visual_gate)} shift={shift:.2f}"
+        visual_dir, direction_reason, direction_confidence = self._visual_pass_direction(
+            gate_idx,
+            sensor_data,
+            detection,
+            image_shape,
+            visual_gate,
         )
-        return corrected
+        if visual_dir is None or direction_confidence < self.min_pass_direction_confidence:
+            reason = f"direction_quality:{direction_reason} confidence={direction_confidence:.2f}"
+            self._log_throttled(
+                f"stored_visual_no_correction_direction_{gate_idx}",
+                now,
+                0.75,
+                f"stored_visual_no_correction lap={self.route_lap} gate={gate_idx} reason={reason} "
+                f"det={self._det_summary(detection)}",
+            )
+            return None, reason
+
+        shift = float(np.linalg.norm(gate[:2] - visual_gate[:2]))
+        vertical_shift = abs(float(gate[2] - visual_gate[2]))
+        old_dir = np.asarray(old_pass_dir, dtype=float).copy()
+        old_dir[2] = 0.0
+        old_norm = np.linalg.norm(old_dir[:2])
+        if old_norm > 1e-9:
+            old_dir /= old_norm
+        direction_alignment = float(np.dot(old_dir[:2], visual_dir[:2])) if old_norm > 1e-9 else 1.0
+        direction_change = math.degrees(math.acos(float(np.clip(direction_alignment, -1.0, 1.0))))
+
+        if shift > self.stored_visual_max_shift:
+            reason = f"shift_too_large shift={shift:.2f} max={self.stored_visual_max_shift:.2f}"
+            self._log(
+                f"stored_visual_no_correction lap={self.route_lap} gate={gate_idx} reason={reason} "
+                f"old={self._vec(gate)} visual={self._vec(visual_gate)} det={self._det_summary(detection)}"
+            )
+            return None, reason
+
+        if shift < self.stored_visual_min_shift and direction_change < 8.0 and vertical_shift < 0.08:
+            self._log_throttled(
+                f"stored_visual_no_correction_small_{gate_idx}",
+                now,
+                0.75,
+                f"stored_visual_no_correction lap={self.route_lap} gate={gate_idx} reason=already_consistent "
+                f"shift={shift:.2f} vertical_shift={vertical_shift:.2f} dir_change={direction_change:.1f}",
+            )
+            return None, "already_consistent"
+
+        corrected = gate.copy()
+        corrected[:2] = (1.0 - self.stored_visual_blend) * gate[:2] + self.stored_visual_blend * visual_gate[:2]
+        corrected[2] = np.clip(
+            (1.0 - self.stored_visual_blend) * gate[2] + self.stored_visual_blend * visual_gate[2],
+            0.70,
+            2.05,
+        )
+        self.gate_estimates[gate_idx] = corrected
+        self._update_pass_direction_from_detection(gate_idx, sensor_data, detection, image_shape, corrected)
+        self._log(
+            f"stored_visual_correction lap={self.route_lap} gate={gate_idx} "
+            f"old={self._vec(gate)} visual={self._vec(visual_gate)} corrected={self._vec(corrected)} "
+            f"shift={shift:.2f} vertical_shift={vertical_shift:.2f} "
+            f"direction_confidence={direction_confidence:.2f} direction_change={direction_change:.1f} "
+            f"reason={direction_reason}"
+        )
+        return corrected, f"shift={shift:.2f}_dir_change={direction_change:.1f}"
 
     def _detection_matches_gate(self, sensor_data, detection, image_shape, gate_idx):
         if not self._is_usable_detection(detection):
@@ -1300,8 +1425,9 @@ class MyAssignment:
         z_cmd = pos[2] + np.clip(z_delta, -0.22, 0.22)
         return [float(cmd_xy[0]), float(cmd_xy[1]), float(z_cmd), float(self._wrap_angle(yaw_target))]
 
-    def _build_stored_replay_plan(self, now, pos):
+    def _build_stored_replay_plan(self, now, pos, start_gate_idx=0, reason="initial"):
         last_plan = None
+        start_gate_idx = int(np.clip(start_gate_idx, 0, self.num_gates))
         for attempt_idx, (attempt_name, entry_distance, exit_distance, time_multiplier) in enumerate(
             self.replay_plan_attempts
         ):
@@ -1312,6 +1438,8 @@ class MyAssignment:
                 entry_distance,
                 exit_distance,
                 time_multiplier,
+                start_gate_idx,
+                reason,
             )
             last_plan = plan
             validation = plan["validation"]
@@ -1341,10 +1469,21 @@ class MyAssignment:
         )
         return last_plan
 
-    def _build_stored_replay_plan_attempt(self, now, pos, attempt_name, entry_distance, exit_distance, time_multiplier):
+    def _build_stored_replay_plan_attempt(
+        self,
+        now,
+        pos,
+        attempt_name,
+        entry_distance,
+        exit_distance,
+        time_multiplier,
+        start_gate_idx,
+        reason,
+    ):
         waypoints = [np.asarray(pos, dtype=float).copy()]
         gates = []
-        for gate_idx, gate_estimate in enumerate(self.gate_estimates):
+        for gate_idx in range(start_gate_idx, self.num_gates):
+            gate_estimate = self.gate_estimates[gate_idx]
             entry, center, exit_point, pass_dir, pass_yaw = self._gate_waypoints(
                 gate_idx,
                 gate_estimate,
@@ -1407,6 +1546,8 @@ class MyAssignment:
             "entry_distance": entry_distance,
             "exit_distance": exit_distance,
             "time_multiplier": time_multiplier,
+            "start_gate_idx": start_gate_idx,
+            "reason": reason,
         }
         validation = self._validate_stored_replay_plan(plan)
         plan["validation"] = validation
@@ -1415,6 +1556,7 @@ class MyAssignment:
             f"duration={times[-1]:.2f} max_speed={metrics['max_speed']:.3f} "
             f"max_accel={metrics['max_accel']:.3f} time_scale={total_time_scale:.2f} "
             f"entry_distance={entry_distance:.2f} exit_distance={exit_distance:.2f} "
+            f"start_gate={start_gate_idx} reason={reason} "
             f"validation={validation['status']}"
         )
         return plan
@@ -1629,12 +1771,13 @@ class MyAssignment:
 
     def _update_stored_replay_progress(self, now, pos, plan, elapsed):
         active = int(plan["active_gate"])
-        if active >= self.num_gates:
+        if active >= len(plan["gates"]):
             self.gate_idx = self.num_gates
             return
 
         gate = plan["gates"][active]
-        self.gate_idx = active
+        gate_idx = gate["gate_idx"]
+        self.gate_idx = gate_idx
         self._log_stored_crossing_margin(
             now,
             pos,
@@ -1647,7 +1790,7 @@ class MyAssignment:
         progress = float(np.dot(pos[:2] - gate["gate"][:2], gate["pass_dir"][:2]))
         exit_error = float(np.linalg.norm(pos - gate["exit"]))
         segment = self._segment_from_position(pos[:2])
-        crossed_expected_segment = segment == active + 1
+        crossed_expected_segment = segment == gate_idx + 1
         done_reason = None
         if progress > 0.76:
             done_reason = "clear_progress"
@@ -1661,19 +1804,22 @@ class MyAssignment:
                 self._log_stored_crossing_sample(
                     "done_before_crossing_log",
                     self.route_lap,
-                    active,
+                    gate_idx,
                     pos,
                     gate["gate"],
                     gate["pass_dir"],
                     progress,
                 )
             self._log(
-                f"stored_replay_gate_done lap={self.route_lap} gate={active} "
+                f"stored_replay_gate_done lap={self.route_lap} gate={gate_idx} "
                 f"reason={done_reason} progress={progress:.2f} "
                 f"exit_error={exit_error:.2f} segment={segment} replay_t={elapsed:.2f}"
             )
             plan["active_gate"] = active + 1
-            self.gate_idx = active + 1
+            if plan["active_gate"] < len(plan["gates"]):
+                self.gate_idx = plan["gates"][plan["active_gate"]]["gate_idx"]
+            else:
+                self.gate_idx = self.num_gates
             self.stored_crossing_key = None
 
     def _smooth_stored_setpoint(self, now, pos, target, yaw_target, key):
