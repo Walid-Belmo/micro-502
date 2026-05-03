@@ -83,7 +83,7 @@ class quadrotor_controller():
         self.trajectory_velocity_ff_scale = 0.0
         self.trajectory_acceleration_ff_scale = 0.0
         if exp_num == 4:
-            self.trajectory_velocity_ff_scale = float(os.environ.get("MICRO502_TRAJ_VEL_FF_SCALE", "0.0"))
+            self.trajectory_velocity_ff_scale = float(os.environ.get("MICRO502_TRAJ_VEL_FF_SCALE", "0.5"))
             self.trajectory_acceleration_ff_scale = float(os.environ.get("MICRO502_TRAJ_ACC_FF_SCALE", "0.0"))
 
         self.tuning_on = False

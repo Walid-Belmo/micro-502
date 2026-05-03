@@ -26,19 +26,30 @@ class MyAssignment:
         self.camera_offset_body = np.array([0.03, 0.0, 0.01])
         self.opening_height = 0.40
         self.assumed_gate_width = 0.40
-        self.replay_speed_limit = float(os.environ.get("MICRO502_REPLAY_SPEED_LIMIT", "2.20"))
-        self.replay_accel_limit = float(os.environ.get("MICRO502_REPLAY_ACCEL_LIMIT", "5.00"))
+        self.replay_speed_limit = float(os.environ.get("MICRO502_REPLAY_SPEED_LIMIT", "4.00"))
+        self.replay_accel_limit = float(os.environ.get("MICRO502_REPLAY_ACCEL_LIMIT", "5.50"))
         self.replay_timing_speed = float(os.environ.get("MICRO502_REPLAY_TIMING_SPEED", "4.50"))
         self.replay_min_segment_time = float(os.environ.get("MICRO502_REPLAY_MIN_SEGMENT_TIME", "0.12"))
         self.replay_max_segment_time = float(os.environ.get("MICRO502_REPLAY_MAX_SEGMENT_TIME", "2.00"))
+        self.replay_turn_time_gain = float(os.environ.get("MICRO502_REPLAY_TURN_TIME_GAIN", "0.00"))
+        self.replay_vertical_time_gain = float(os.environ.get("MICRO502_REPLAY_VERTICAL_TIME_GAIN", "0.00"))
         self.replay_waypoint_tolerance = 0.035
         self.replay_min_width_margin = 0.090
         self.replay_min_height_margin = 0.120
         self.replay_min_bounds_margin = 0.050
+        replay_entry_distance = float(os.environ.get("MICRO502_REPLAY_ENTRY_DISTANCE", "0.58"))
+        replay_exit_distance = float(os.environ.get("MICRO502_REPLAY_EXIT_DISTANCE", "0.88"))
+        replay_time_multiplier = float(os.environ.get("MICRO502_REPLAY_TIME_MULTIPLIER", "1.00"))
+        replay_short_entry_distance = float(os.environ.get("MICRO502_REPLAY_SHORT_ENTRY_DISTANCE", "0.46"))
+        replay_short_exit_distance = float(os.environ.get("MICRO502_REPLAY_SHORT_EXIT_DISTANCE", "0.68"))
+        replay_short_time_multiplier = float(os.environ.get("MICRO502_REPLAY_SHORT_TIME_MULTIPLIER", "1.12"))
+        replay_shortest_entry_distance = float(os.environ.get("MICRO502_REPLAY_SHORTEST_ENTRY_DISTANCE", "0.34"))
+        replay_shortest_exit_distance = float(os.environ.get("MICRO502_REPLAY_SHORTEST_EXIT_DISTANCE", "0.50"))
+        replay_shortest_time_multiplier = float(os.environ.get("MICRO502_REPLAY_SHORTEST_TIME_MULTIPLIER", "1.30"))
         self.replay_plan_attempts = (
-            ("normal", 0.58, 0.88, 1.00),
-            ("shorter_standoffs", 0.46, 0.68, 1.12),
-            ("shortest_slowest", 0.34, 0.50, 1.30),
+            ("normal", replay_entry_distance, replay_exit_distance, replay_time_multiplier),
+            ("shorter_standoffs", replay_short_entry_distance, replay_short_exit_distance, replay_short_time_multiplier),
+            ("shortest_slowest", replay_shortest_entry_distance, replay_shortest_exit_distance, replay_shortest_time_multiplier),
         )
 
         self.route_lap = 0
@@ -1576,17 +1587,46 @@ class MyAssignment:
         return plan
 
     def _stored_replay_times(self, waypoints):
-        times = [0.0]
-        for idx in range(1, len(waypoints)):
-            distance = float(np.linalg.norm(waypoints[idx] - waypoints[idx - 1]))
-            segment_time = float(
-                np.clip(
-                    distance / self.replay_timing_speed,
-                    self.replay_min_segment_time,
-                    self.replay_max_segment_time,
-                )
-            )
-            times.append(times[-1] + segment_time)
+        waypoints = np.asarray(waypoints, dtype=float)
+        segment_vectors = waypoints[1:] - waypoints[:-1]
+        distances = np.linalg.norm(segment_vectors, axis=1)
+        safe_distances = np.maximum(distances, 1e-6)
+
+        base_segment_times = np.clip(
+            safe_distances / self.replay_timing_speed,
+            self.replay_min_segment_time,
+            self.replay_max_segment_time,
+        )
+        total_time = float(np.sum(base_segment_times))
+        if len(segment_vectors) <= 1 or total_time <= 0.0:
+            return np.concatenate(([0.0], np.cumsum(base_segment_times)))
+
+        weights = safe_distances.copy()
+        vertical_fraction = np.abs(segment_vectors[:, 2]) / safe_distances
+        weights *= 1.0 + self.replay_vertical_time_gain * vertical_fraction
+
+        for waypoint_idx in range(1, len(waypoints) - 1):
+            prev_vec = segment_vectors[waypoint_idx - 1]
+            next_vec = segment_vectors[waypoint_idx]
+            prev_norm = float(np.linalg.norm(prev_vec))
+            next_norm = float(np.linalg.norm(next_vec))
+            if prev_norm < 1e-6 or next_norm < 1e-6:
+                continue
+
+            cosine = float(np.clip(np.dot(prev_vec, next_vec) / (prev_norm * next_norm), -1.0, 1.0))
+            turn_fraction = math.acos(cosine) / math.pi
+            turn_weight = self.replay_turn_time_gain * turn_fraction * 0.5 * (safe_distances[waypoint_idx - 1] + safe_distances[waypoint_idx])
+            weights[waypoint_idx - 1] += 0.5 * turn_weight
+            weights[waypoint_idx] += 0.5 * turn_weight
+
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 0.0:
+            durations = base_segment_times
+        else:
+            durations = total_time * weights / weight_sum
+            durations = np.maximum(durations, self.replay_min_segment_time)
+
+        times = np.concatenate(([0.0], np.cumsum(durations)))
         return np.asarray(times, dtype=float)
 
     def _minimum_jerk_poly_matrix(self, t):
