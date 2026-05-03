@@ -49,6 +49,8 @@ class MyAssignment:
 
         self.search_started_at = 0.0
         self.search_gate_idx = None
+        self.search_probe_idx = 0
+        self.search_probe_arrived_at = 0.0
         self.last_detection_time = [-1e9] * self.num_gates
         self.last_observation_time = [-1e9] * self.num_gates
         self.last_detection = None
@@ -86,22 +88,46 @@ class MyAssignment:
 
         detection = self._detect_gate(camera_data)
         raw_detection = detection
+        detection_matches_gate = False
         if (
             detection is not None
             and self.gate_idx < self.num_gates
-            and (not self.started_course or not self._detection_matches_gate(sensor_data, detection, camera_data.shape, self.gate_idx))
         ):
-            reason = "course_not_started" if not self.started_course else "does_not_match_expected_gate"
-            self._log_throttled(
-                f"reject_detection_gate_{self.gate_idx}_{reason}",
-                now,
-                0.75,
-                f"detection_rejected gate={self.gate_idx} reason={reason} det={self._det_summary(raw_detection)}",
-            )
-            detection = None
+            if not self.started_course:
+                self._log_throttled(
+                    f"reject_detection_gate_{self.gate_idx}_course_not_started",
+                    now,
+                    0.75,
+                    f"detection_rejected gate={self.gate_idx} reason=course_not_started det={self._det_summary(raw_detection)}",
+                )
+                detection = None
+            else:
+                detection_matches_gate = self._detection_matches_gate(sensor_data, detection, camera_data.shape, self.gate_idx)
+                if not detection_matches_gate:
+                    if self.route_lap == 0 and self.commit_gate_idx is None and self._detection_is_search_hint(
+                        sensor_data,
+                        detection,
+                        camera_data.shape,
+                        self.gate_idx,
+                    ):
+                        self._log_throttled(
+                            f"search_hint_gate_{self.gate_idx}",
+                            now,
+                            0.75,
+                            f"detection_search_hint gate={self.gate_idx} det={self._det_summary(raw_detection)}",
+                        )
+                    else:
+                        self._log_throttled(
+                            f"reject_detection_gate_{self.gate_idx}_does_not_match_expected_gate",
+                            now,
+                            0.75,
+                            f"detection_rejected gate={self.gate_idx} reason=does_not_match_expected_gate det={self._det_summary(raw_detection)}",
+                        )
+                        detection = None
 
         if (
             detection is not None
+            and detection_matches_gate
             and self.gate_idx < self.num_gates
             and self.started_course
             and self.route_lap == 0
@@ -264,45 +290,99 @@ class MyAssignment:
         if self.search_gate_idx != gate_idx:
             self.search_gate_idx = gate_idx
             self.search_started_at = now
+            self.search_probe_idx = 0
+            self.search_probe_arrived_at = 0.0
             self._log(f"search_start gate={gate_idx} expected={self._vec(self._expected_gate_position(gate_idx))}")
 
-        expected_gate = self._expected_gate_position(gate_idx)
-        pass_dir = self._pass_direction_for_gate(gate_idx, expected_gate)
-        pass_yaw = math.atan2(pass_dir[1], pass_dir[0])
-        standoff = expected_gate - 0.75 * pass_dir
-        standoff[2] = 1.25
-
         estimate = self.gate_estimates[gate_idx]
-        if estimate is not None and now - self.last_detection_time[gate_idx] < 1.0:
+        recent_estimate = estimate is not None and now - self.last_detection_time[gate_idx] < 1.0
+        if recent_estimate:
             standoff = estimate - 0.55 * self._pass_direction_for_gate(gate_idx, estimate, pos)
             standoff[2] = np.clip(estimate[2], 0.75, 2.05)
-            pass_yaw = self._yaw_to_point(pos, estimate)
+            look_at = estimate
             self._log_throttled(
                 f"search_using_recent_estimate_{gate_idx}",
                 now,
                 0.75,
                 f"search_using_recent_estimate gate={gate_idx} estimate={self._vec(estimate)} standoff={self._vec(standoff)}",
             )
+        else:
+            look_at, standoff, probe_label = self._search_probe_target(gate_idx, self.search_probe_idx)
+            self._log_throttled(
+                f"search_probe_{gate_idx}",
+                now,
+                1.0,
+                f"search_probe gate={gate_idx} probe={self.search_probe_idx} {probe_label} "
+                f"look_at={self._vec(look_at)} standoff={self._vec(standoff)}",
+            )
 
-        dist_to_standoff = np.linalg.norm(pos[:2] - standoff[:2])
-        if dist_to_standoff > 0.32:
+        pass_yaw = self._yaw_to_point(pos, look_at)
+
+        dist_xy = np.linalg.norm(pos[:2] - standoff[:2])
+        dist_z = abs(pos[2] - standoff[2])
+        if dist_xy > 0.32 or dist_z > 0.22:
+            if not recent_estimate:
+                self.search_probe_arrived_at = 0.0
             self._log_throttled(
                 f"search_move_to_standoff_{gate_idx}",
                 now,
                 1.0,
-                f"search_move_to_standoff gate={gate_idx} dist={dist_to_standoff:.2f} target={self._vec(standoff)} yaw={pass_yaw:.3f}",
+                f"search_move_to_standoff gate={gate_idx} dist_xy={dist_xy:.2f} dist_z={dist_z:.2f} "
+                f"target={self._vec(standoff)} yaw={pass_yaw:.3f}",
             )
-            return self._limited_setpoint(pos, standoff, max_step=0.50, yaw_target=pass_yaw)
+            return self._limited_setpoint(pos, standoff, max_step=0.55, yaw_target=pass_yaw)
 
-        scan = 0.70 * math.sin(0.55 * (now - self.search_started_at))
+        if not recent_estimate:
+            if self.search_probe_arrived_at <= 0.0:
+                self.search_probe_arrived_at = now
+            elif now - self.search_probe_arrived_at > 2.0:
+                self.search_probe_idx = (self.search_probe_idx + 1) % len(self._search_probe_specs())
+                self.search_probe_arrived_at = 0.0
+                look_at, standoff, probe_label = self._search_probe_target(gate_idx, self.search_probe_idx)
+                pass_yaw = self._yaw_to_point(pos, look_at)
+                self._log(
+                    f"search_next_probe gate={gate_idx} probe={self.search_probe_idx} {probe_label} "
+                    f"look_at={self._vec(look_at)} standoff={self._vec(standoff)}"
+                )
+                return self._limited_setpoint(pos, standoff, max_step=0.55, yaw_target=pass_yaw)
+
+        scan = 0.28 * math.sin(1.10 * (now - self.search_started_at))
         yaw_target = self._wrap_angle(pass_yaw + scan)
         self._log_throttled(
             f"search_scan_{gate_idx}",
             now,
             1.0,
-            f"search_scan gate={gate_idx} standoff={self._vec(standoff)} yaw={yaw_target:.3f} scan={scan:.3f}",
+            f"search_scan gate={gate_idx} standoff={self._vec(standoff)} look_at={self._vec(look_at)} "
+            f"yaw={yaw_target:.3f} scan={scan:.3f}",
         )
         return self._limited_setpoint(pos, standoff, max_step=0.18, yaw_target=yaw_target)
+
+    def _search_probe_specs(self):
+        edge_offset = 0.42 * self.segment_angular_size
+        return [
+            (self.nominal_radius, 0.0, 1.35),
+            (self.outer_radius - 0.15, -edge_offset, 1.65),
+            (self.outer_radius - 0.15, 0.0, 1.75),
+            (self.outer_radius - 0.15, edge_offset, 1.65),
+            (self.inner_radius + 0.20, -edge_offset, 0.95),
+            (self.inner_radius + 0.20, 0.0, 1.05),
+            (self.inner_radius + 0.20, edge_offset, 0.95),
+            (self.nominal_radius, -edge_offset, 1.85),
+            (self.nominal_radius, edge_offset, 0.85),
+        ]
+
+    def _search_probe_target(self, gate_idx, probe_idx):
+        specs = self._search_probe_specs()
+        radius, angle_offset, height = specs[probe_idx % len(specs)]
+        angle = self._expected_angle(gate_idx) + angle_offset
+        gate = self._gate_position_from_angle_radius(angle, radius, height)
+        pass_dir = self._geometric_pass_direction_for_gate(gate_idx, gate)
+        standoff = gate - 0.78 * pass_dir
+        standoff[0] = np.clip(standoff[0], 0.35, 7.65)
+        standoff[1] = np.clip(standoff[1], 0.35, 7.65)
+        standoff[2] = np.clip(height, 0.78, 1.95)
+        label = f"radius={radius:.2f} angle_offset={angle_offset:.2f} height={height:.2f}"
+        return gate, standoff, label
 
     def _vision_servo_command(self, pos, yaw, detection):
         err_x = detection["err_x"]
@@ -700,6 +780,30 @@ class MyAssignment:
         bearing_alignment = float(np.dot(to_estimate / dist, ray_dir))
         return bearing_alignment > 0.86
 
+    def _detection_is_search_hint(self, sensor_data, detection, image_shape, gate_idx):
+        if not self._is_usable_detection(detection):
+            return False
+
+        camera_pos, ray_dir = self._camera_ray(sensor_data, detection, image_shape)
+        expected = self._expected_angle(gate_idx)
+        max_angle_error = 0.75 * self.segment_angular_size
+
+        for depth in np.linspace(0.35, 4.80, 22):
+            point = camera_pos + depth * ray_dir
+            if point[2] < 0.45 or point[2] > 2.25:
+                continue
+
+            rel = point[:2] - self.center
+            radius = np.linalg.norm(rel)
+            if radius < self.inner_radius - 0.35 or radius > self.outer_radius + 0.45:
+                continue
+
+            angle = self._angle_from_position(point[:2])
+            if abs(self._angle_diff(angle, expected)) <= max_angle_error:
+                return True
+
+        return False
+
     def _detect_gate(self, camera_data):
         if camera_data is None or camera_data.size == 0:
             return None
@@ -900,11 +1004,14 @@ class MyAssignment:
 
     def _expected_gate_position(self, gate_idx):
         angle = self._expected_angle(gate_idx)
+        return self._gate_position_from_angle_radius(angle, self.nominal_radius, 1.25)
+
+    def _gate_position_from_angle_radius(self, angle, radius, height):
         return np.array(
             [
-                self.center[0] - self.nominal_radius * math.cos(angle),
-                self.center[1] - self.nominal_radius * math.sin(angle),
-                1.25,
+                self.center[0] - radius * math.cos(angle),
+                self.center[1] - radius * math.sin(angle),
+                height,
             ]
         )
 
