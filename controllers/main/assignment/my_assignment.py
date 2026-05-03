@@ -49,6 +49,8 @@ class MyAssignment:
         self.stored_crossing_prev_pos = None
         self.stored_crossing_prev_progress = None
         self.stored_crossing_logged = False
+        self.stored_replay_plan = None
+        self.stored_replay_lap = None
         self.stored_motion_lap_max_speed = 0.0
         self.stored_motion_lap_max_accel = 0.0
         self.stored_motion_lap_max_speed_context = "none"
@@ -230,72 +232,36 @@ class MyAssignment:
     def _stored_lap_command(self, now, pos, yaw, sensor_data, detection, image_shape):
         self.phase = f"stored_lap_{self.route_lap}"
 
-        if self.gate_idx >= self.num_gates:
-            if self.route_lap > 0:
-                self._log_stored_motion_summary_once(self.route_lap, "all_gates_commanded")
-            return self._return_to_start_or_next_lap(now, pos, lap_after_return=self.route_lap + 1)
-
-        gate = self.gate_estimates[self.gate_idx]
-        if gate is None:
+        if any(gate is None for gate in self.gate_estimates):
             self.stage = "fallback_search"
             return self._search_command(now, pos, self.gate_idx)
 
-        gate = self._correct_stored_gate_from_vision(now, pos, sensor_data, detection, image_shape, gate.copy())
-        entry, center, exit_point, pass_dir, pass_yaw = self._gate_waypoints(self.gate_idx, gate)
-        self._log_stored_crossing_margin(now, pos, gate, entry, center, exit_point, pass_dir)
-
-        if self.stored_stage == "entry":
-            self.stage = "stored_entry"
-            if np.linalg.norm(pos - entry) < 0.24:
-                self._log(f"stored_entry_reached lap={self.route_lap} gate={self.gate_idx}")
-                self.stored_stage = "center"
-            else:
-                return self._smooth_stored_setpoint(now, pos, entry, pass_yaw, ("entry", self.route_lap, self.gate_idx))
-
-        if self.stored_stage == "center":
-            self.stage = "stored_center"
-            if np.linalg.norm(pos - center) < 0.21:
-                self._log(f"stored_center_reached lap={self.route_lap} gate={self.gate_idx}")
-                self.stored_stage = "exit"
-            else:
-                return self._smooth_stored_setpoint(now, pos, center, pass_yaw, ("center", self.route_lap, self.gate_idx))
-
-        self.stage = "stored_exit"
-        progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
-        exit_error = np.linalg.norm(pos - exit_point)
-        segment = self._segment_from_position(pos[:2])
-        crossed_expected_segment = segment == self.gate_idx + 1
-        done_reason = None
-        if progress > 0.76:
-            done_reason = "clear_progress"
-        elif crossed_expected_segment and progress > 0.42:
-            done_reason = "next_segment"
-        elif exit_error < 0.28 and progress > 0.50:
-            done_reason = "near_exit"
-
-        if done_reason is not None:
-            if not self.stored_crossing_logged:
-                self._log_stored_crossing_sample(
-                    "done_before_crossing_log",
-                    self.route_lap,
-                    self.gate_idx,
-                    pos,
-                    gate,
-                    pass_dir,
-                    progress,
-                )
-            self._log(
-                f"stored_gate_done lap={self.route_lap} gate={self.gate_idx} "
-                f"reason={done_reason} progress={progress:.2f} "
-                f"exit_error={exit_error:.2f} segment={segment}"
-            )
-            self.gate_idx += 1
-            self.stored_stage = "entry"
-            self.stored_curve_key = None
+        if self.stored_replay_plan is None or self.stored_replay_lap != self.route_lap:
+            self.stored_replay_plan = self._build_stored_replay_plan(now, pos)
+            self.stored_replay_lap = self.route_lap
+            self.gate_idx = 0
+            self.stored_stage = "replay"
             self.stored_crossing_key = None
-            return self._stored_lap_command(now, pos, yaw, sensor_data, detection, image_shape)
+            self._reset_stored_motion_lap_metrics()
+            self.stored_motion_summary_lap = None
 
-        return self._smooth_stored_setpoint(now, pos, exit_point, pass_yaw, ("exit", self.route_lap, self.gate_idx))
+        plan = self.stored_replay_plan
+        elapsed = max(0.0, now - plan["start_time"])
+        target, velocity, acceleration = self._sample_stored_replay(plan, elapsed)
+        speed = float(np.linalg.norm(velocity))
+        accel = float(np.linalg.norm(acceleration))
+        total_time = max(float(plan["times"][-1]), 1e-6)
+        self._record_stored_motion_metrics(speed, accel, ("replay", self.route_lap), min(elapsed / total_time, 1.0))
+        self._update_stored_replay_progress(now, pos, plan, elapsed)
+
+        if elapsed >= total_time:
+            if self.route_lap > 0:
+                self._log_stored_motion_summary_once(self.route_lap, "replay_time_complete")
+            return self._return_to_start_or_next_lap(now, pos, lap_after_return=self.route_lap + 1)
+
+        self.stage = "stored_replay"
+        yaw_target = math.atan2(velocity[1], velocity[0]) if np.linalg.norm(velocity[:2]) > 0.03 else yaw
+        return [float(target[0]), float(target[1]), float(target[2]), float(self._wrap_angle(yaw_target))]
 
     def _return_to_start_or_next_lap(self, now, pos, lap_after_return):
         self.phase = "return_to_start"
@@ -311,6 +277,8 @@ class MyAssignment:
             self.stored_stage = "entry"
             self.stored_curve_key = None
             self.stored_crossing_key = None
+            self.stored_replay_plan = None
+            self.stored_replay_lap = None
             self._reset_stored_motion_lap_metrics()
             self.stored_motion_summary_lap = None
             self.pass_stage = "center"
@@ -1201,6 +1169,205 @@ class MyAssignment:
         z_delta = target[2] - pos[2]
         z_cmd = pos[2] + np.clip(z_delta, -0.22, 0.22)
         return [float(cmd_xy[0]), float(cmd_xy[1]), float(z_cmd), float(self._wrap_angle(yaw_target))]
+
+    def _build_stored_replay_plan(self, now, pos):
+        waypoints = [np.asarray(pos, dtype=float).copy()]
+        gates = []
+        for gate_idx, gate_estimate in enumerate(self.gate_estimates):
+            entry, center, exit_point, pass_dir, pass_yaw = self._gate_waypoints(gate_idx, gate_estimate)
+            entry_idx = len(waypoints)
+            center_idx = entry_idx + 1
+            exit_idx = entry_idx + 2
+            waypoints.extend([entry, center, exit_point])
+            gates.append(
+                {
+                    "gate_idx": gate_idx,
+                    "gate": center.copy(),
+                    "entry": entry.copy(),
+                    "center": center.copy(),
+                    "exit": exit_point.copy(),
+                    "pass_dir": pass_dir.copy(),
+                    "pass_yaw": pass_yaw,
+                    "entry_idx": entry_idx,
+                    "center_idx": center_idx,
+                    "exit_idx": exit_idx,
+                    "done": False,
+                }
+            )
+
+        waypoints.append(self.takeoff_pos.copy())
+        waypoints = np.asarray(waypoints, dtype=float)
+        times = self._stored_replay_times(waypoints)
+        coeffs = self._minimum_jerk_coefficients(waypoints, times)
+        metrics = self._stored_replay_metrics(coeffs, times)
+
+        target_speed = 1.85
+        target_accel = 6.50
+        scale = max(1.0, metrics["max_speed"] / target_speed, math.sqrt(metrics["max_accel"] / target_accel))
+        if scale > 1.0:
+            times = times * scale
+            coeffs = self._minimum_jerk_coefficients(waypoints, times)
+            metrics = self._stored_replay_metrics(coeffs, times)
+
+        for gate in gates:
+            gate["entry_time"] = float(times[gate["entry_idx"]])
+            gate["center_time"] = float(times[gate["center_idx"]])
+            gate["exit_time"] = float(times[gate["exit_idx"]])
+
+        self._log(
+            f"stored_replay_plan lap={self.route_lap} waypoints={len(waypoints)} "
+            f"duration={times[-1]:.2f} max_speed={metrics['max_speed']:.3f} "
+            f"max_accel={metrics['max_accel']:.3f} time_scale={scale:.2f}"
+        )
+        return {
+            "start_time": now,
+            "waypoints": waypoints,
+            "times": times,
+            "coeffs": coeffs,
+            "gates": gates,
+            "active_gate": 0,
+            "metrics": metrics,
+        }
+
+    def _stored_replay_times(self, waypoints):
+        times = [0.0]
+        for idx in range(1, len(waypoints)):
+            distance = float(np.linalg.norm(waypoints[idx] - waypoints[idx - 1]))
+            segment_time = float(np.clip(distance / 0.72, 0.80, 3.80))
+            times.append(times[-1] + segment_time)
+        return np.asarray(times, dtype=float)
+
+    def _minimum_jerk_poly_matrix(self, t):
+        return np.array(
+            [
+                [t**5, t**4, t**3, t**2, t, 1.0],
+                [5.0 * t**4, 4.0 * t**3, 3.0 * t**2, 2.0 * t, 1.0, 0.0],
+                [20.0 * t**3, 12.0 * t**2, 6.0 * t, 2.0, 0.0, 0.0],
+                [60.0 * t**2, 24.0 * t, 6.0, 0.0, 0.0, 0.0],
+                [120.0 * t, 24.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        )
+
+    def _minimum_jerk_coefficients(self, waypoints, times):
+        seg_times = np.diff(times)
+        segment_count = len(waypoints) - 1
+        coeffs = np.zeros((6 * segment_count, 3), dtype=float)
+        A_0 = self._minimum_jerk_poly_matrix(0.0)
+
+        for dim in range(3):
+            A = np.zeros((6 * segment_count, 6 * segment_count), dtype=float)
+            b = np.zeros(6 * segment_count, dtype=float)
+            row = 0
+            pos = waypoints[:, dim]
+            for idx in range(segment_count):
+                A_f = self._minimum_jerk_poly_matrix(float(seg_times[idx]))
+                A[row, idx * 6 : (idx + 1) * 6] = A_0[0]
+                b[row] = pos[idx]
+                row += 1
+                A[row, idx * 6 : (idx + 1) * 6] = A_f[0]
+                b[row] = pos[idx + 1]
+                row += 1
+
+                if idx == 0:
+                    A[row, idx * 6 : (idx + 1) * 6] = A_0[1]
+                    row += 1
+                    A[row, idx * 6 : (idx + 1) * 6] = A_0[2]
+                    row += 1
+
+                if idx < segment_count - 1:
+                    A[row : row + 4, idx * 6 : (idx + 1) * 6] = A_f[1:]
+                    A[row : row + 4, (idx + 1) * 6 : (idx + 2) * 6] = -A_0[1:]
+                    row += 4
+                else:
+                    A[row, idx * 6 : (idx + 1) * 6] = A_f[1]
+                    row += 1
+                    A[row, idx * 6 : (idx + 1) * 6] = A_f[2]
+                    row += 1
+
+            coeffs[:, dim] = np.linalg.solve(A, b)
+
+        return coeffs
+
+    def _sample_stored_replay(self, plan, elapsed):
+        times = plan["times"]
+        coeffs = plan["coeffs"]
+        t = float(np.clip(elapsed, 0.0, times[-1]))
+        seg_idx = min(max(np.searchsorted(times, t, side="right") - 1, 0), len(times) - 2)
+        local_t = t - times[seg_idx]
+        basis = self._minimum_jerk_poly_matrix(local_t)
+        seg_coeffs = coeffs[seg_idx * 6 : (seg_idx + 1) * 6]
+        target = basis[0] @ seg_coeffs
+        velocity = basis[1] @ seg_coeffs
+        acceleration = basis[2] @ seg_coeffs
+        target[0] = np.clip(target[0], 0.25, 7.75)
+        target[1] = np.clip(target[1], 0.25, 7.75)
+        target[2] = np.clip(target[2], 0.65, 2.10)
+        return target, velocity, acceleration
+
+    def _stored_replay_metrics(self, coeffs, times):
+        max_speed = 0.0
+        max_accel = 0.0
+        sample_count = max(80, int(math.ceil(times[-1] / 0.08)))
+        for t in np.linspace(0.0, times[-1], sample_count):
+            seg_idx = min(max(np.searchsorted(times, t, side="right") - 1, 0), len(times) - 2)
+            local_t = t - times[seg_idx]
+            basis = self._minimum_jerk_poly_matrix(float(local_t))
+            seg_coeffs = coeffs[seg_idx * 6 : (seg_idx + 1) * 6]
+            velocity = basis[1] @ seg_coeffs
+            acceleration = basis[2] @ seg_coeffs
+            max_speed = max(max_speed, float(np.linalg.norm(velocity)))
+            max_accel = max(max_accel, float(np.linalg.norm(acceleration)))
+        return {"max_speed": max_speed, "max_accel": max_accel}
+
+    def _update_stored_replay_progress(self, now, pos, plan, elapsed):
+        active = int(plan["active_gate"])
+        if active >= self.num_gates:
+            self.gate_idx = self.num_gates
+            return
+
+        gate = plan["gates"][active]
+        self.gate_idx = active
+        self._log_stored_crossing_margin(
+            now,
+            pos,
+            gate["gate"],
+            gate["entry"],
+            gate["center"],
+            gate["exit"],
+            gate["pass_dir"],
+        )
+        progress = float(np.dot(pos[:2] - gate["gate"][:2], gate["pass_dir"][:2]))
+        exit_error = float(np.linalg.norm(pos - gate["exit"]))
+        segment = self._segment_from_position(pos[:2])
+        crossed_expected_segment = segment == active + 1
+        done_reason = None
+        if progress > 0.76:
+            done_reason = "clear_progress"
+        elif crossed_expected_segment and progress > 0.42:
+            done_reason = "next_segment"
+        elif exit_error < 0.28 and progress > 0.50:
+            done_reason = "near_exit"
+
+        if done_reason is not None:
+            if not self.stored_crossing_logged:
+                self._log_stored_crossing_sample(
+                    "done_before_crossing_log",
+                    self.route_lap,
+                    active,
+                    pos,
+                    gate["gate"],
+                    gate["pass_dir"],
+                    progress,
+                )
+            self._log(
+                f"stored_replay_gate_done lap={self.route_lap} gate={active} "
+                f"reason={done_reason} progress={progress:.2f} "
+                f"exit_error={exit_error:.2f} segment={segment} replay_t={elapsed:.2f}"
+            )
+            plan["active_gate"] = active + 1
+            self.gate_idx = active + 1
+            self.stored_crossing_key = None
 
     def _smooth_stored_setpoint(self, now, pos, target, yaw_target, key):
         target = np.asarray(target, dtype=float).copy()
