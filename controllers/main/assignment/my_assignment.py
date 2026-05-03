@@ -76,6 +76,14 @@ class MyAssignment:
         self.gate_pass_direction_confidence = [0.0] * self.num_gates
         self.estimate_samples = [0] * self.num_gates
         self.ray_observations = [[] for _ in range(self.num_gates)]
+        self.estimate_history = [[] for _ in range(self.num_gates)]
+        self.gate_estimate_quality = [None] * self.num_gates
+        self.min_reliable_estimate_samples = 3
+        self.min_reliable_observations = 3
+        self.min_reliable_baseline = 0.16
+        self.max_reliable_ray_residual = 0.22
+        self.max_reliable_recent_spread = 0.26
+        self.min_pass_direction_confidence = 0.25
 
         self.search_started_at = 0.0
         self.search_gate_idx = None
@@ -485,6 +493,30 @@ class MyAssignment:
             return False
 
         gate = self.gate_estimates[self.gate_idx]
+        quality_ok, quality_reason, quality = self._estimate_quality_ready_for_commit(self.gate_idx)
+        if not quality_ok:
+            self._log_throttled(
+                f"commit_not_ready_estimate_quality_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=estimate_quality:{quality_reason} "
+                f"{self._quality_summary(quality)} det={self._det_summary(detection)}",
+            )
+            return False
+
+        direction_source = self.gate_pass_direction_sources[self.gate_idx]
+        direction_confidence = self.gate_pass_direction_confidence[self.gate_idx]
+        if direction_source != "vision_pose" or direction_confidence < self.min_pass_direction_confidence:
+            self._log_throttled(
+                f"commit_not_ready_direction_quality_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=direction_quality "
+                f"source={direction_source} confidence={direction_confidence:.2f} "
+                f"required={self.min_pass_direction_confidence:.2f} det={self._det_summary(detection)}",
+            )
+            return False
+
         pass_dir = self._pass_direction_for_gate(self.gate_idx, gate, pos)
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
         if progress > 0.20:
@@ -754,12 +786,27 @@ class MyAssignment:
         else:
             estimate = 0.72 * old + 0.28 * candidate
         estimate[2] = np.clip(estimate[2], 0.70, 2.05)
+        samples_after = self.estimate_samples[gate_idx] + 1
+        quality = self._evaluate_gate_estimate_quality(
+            gate_idx,
+            estimate,
+            source,
+            detection,
+            observations,
+            samples_after,
+        )
         self.gate_estimates[gate_idx] = estimate
-        self.estimate_samples[gate_idx] += 1
+        self.estimate_samples[gate_idx] = samples_after
+        self.gate_estimate_quality[gate_idx] = quality
+        history = self.estimate_history[gate_idx]
+        history.append(estimate.copy())
+        if len(history) > 8:
+            history.pop(0)
         self._update_pass_direction_from_detection(gate_idx, sensor_data, detection, image_shape, estimate)
         self._log(
             f"estimate_accept gate={gate_idx} source={source} samples={self.estimate_samples[gate_idx]} "
-            f"estimate={self._vec(estimate)} candidate={self._vec(candidate)} mono_reason={mono_reason} tri_reason={tri_reason}"
+            f"estimate={self._vec(estimate)} candidate={self._vec(candidate)} mono_reason={mono_reason} tri_reason={tri_reason} "
+            f"quality={quality['status']} reason={quality['reason']} {self._quality_summary(quality)}"
         )
 
     def _current_visual_gate_estimate(self, gate_idx, sensor_data, detection, image_shape, require_full):
@@ -1131,6 +1178,78 @@ class MyAssignment:
             point = np.linalg.lstsq(a, b, rcond=None)[0]
 
         return point
+
+    def _evaluate_gate_estimate_quality(self, gate_idx, estimate, source, detection, observations, samples_after):
+        baseline = self._ray_observation_baseline(observations)
+        residual = self._ray_residual(estimate, observations)
+        recent_spread = self._recent_estimate_spread(gate_idx, estimate)
+        full_detection = self._is_full_gate_detection(detection)
+
+        checks = [
+            ("samples", samples_after >= self.min_reliable_estimate_samples),
+            ("observations", len(observations) >= self.min_reliable_observations),
+            ("baseline", baseline >= self.min_reliable_baseline),
+            ("ray_residual", residual <= self.max_reliable_ray_residual),
+            ("recent_spread", recent_spread <= self.max_reliable_recent_spread),
+            ("full_detection", full_detection),
+        ]
+        failed = [name for name, ok in checks if not ok]
+        ok = not failed
+        return {
+            "ok": ok,
+            "status": "ok" if ok else "not_ready",
+            "reason": "ok" if ok else "+".join(failed),
+            "source": source,
+            "samples": samples_after,
+            "observations": len(observations),
+            "baseline": baseline,
+            "ray_residual": residual,
+            "recent_spread": recent_spread,
+            "full_detection": full_detection,
+        }
+
+    def _estimate_quality_ready_for_commit(self, gate_idx):
+        quality = self.gate_estimate_quality[gate_idx]
+        if quality is None:
+            return False, "missing_quality", None
+        if not quality["ok"]:
+            return False, quality["reason"], quality
+        return True, "ok", quality
+
+    def _ray_observation_baseline(self, observations):
+        if len(observations) < 2:
+            return 0.0
+
+        max_distance = 0.0
+        for i in range(len(observations)):
+            for j in range(i + 1, len(observations)):
+                distance = float(np.linalg.norm(observations[i][0] - observations[j][0]))
+                max_distance = max(max_distance, distance)
+        return max_distance
+
+    def _ray_residual(self, point, observations):
+        if point is None or len(observations) < 2:
+            return float("inf")
+
+        point = np.asarray(point, dtype=float)
+        distances = []
+        for camera_pos, direction in observations:
+            direction = direction / max(np.linalg.norm(direction), 1e-9)
+            delta = point - camera_pos
+            perpendicular = delta - float(np.dot(delta, direction)) * direction
+            distances.append(float(np.linalg.norm(perpendicular)))
+        if not distances:
+            return float("inf")
+        return float(np.mean(distances))
+
+    def _recent_estimate_spread(self, gate_idx, estimate):
+        recent = self.estimate_history[gate_idx][-4:] + [np.asarray(estimate, dtype=float).copy()]
+        if len(recent) < 3:
+            return float("inf")
+
+        points = np.asarray(recent, dtype=float)
+        center = np.mean(points, axis=0)
+        return float(np.max(np.linalg.norm(points - center, axis=1)))
 
     def _sanitize_gate_estimate(self, gate_idx, estimate):
         sanitized, _ = self._sanitize_gate_estimate_with_reason(gate_idx, estimate)
@@ -1922,6 +2041,15 @@ class MyAssignment:
             f"err=({detection['err_x']:.2f},{detection['err_y']:.2f}) "
             f"bbox=({x},{y},{bw},{bh}) fill={detection.get('fill', 0.0):.2f} "
             f"edge={detection.get('touches_edge', False)}"
+        )
+
+    def _quality_summary(self, quality):
+        if quality is None:
+            return "quality=missing"
+        return (
+            f"quality={quality['status']} samples={quality['samples']} obs={quality['observations']} "
+            f"baseline={quality['baseline']:.2f} residual={quality['ray_residual']:.2f} "
+            f"spread={quality['recent_spread']:.2f} full={quality['full_detection']}"
         )
 
     def _pass_dir_summary(self):
