@@ -1,6 +1,7 @@
 # Low-level PID control of velocity and attitude
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 from lib.simple_pid import PID
 from scipy.spatial.transform import Rotation as R
 
@@ -64,9 +65,26 @@ class quadrotor_controller():
                         "L_vel_xy": 2.0
                         }
             ### END EXERCISE 1 SOLUTION ###
+
+        if exp_num == 4:
+            gains["P_pos_xy"] = float(os.environ.get("MICRO502_P_POS_XY", gains["P_pos_xy"]))
+            gains["P_vel_xy"] = float(os.environ.get("MICRO502_P_VEL_XY", gains["P_vel_xy"]))
+            gains["D_vel_xy"] = float(os.environ.get("MICRO502_D_VEL_XY", gains["D_vel_xy"]))
+            gains["P_att_rp"] = float(os.environ.get("MICRO502_P_ATT_RP", gains["P_att_rp"]))
+            gains["D_att_rp"] = float(os.environ.get("MICRO502_D_ATT_RP", gains["D_att_rp"]))
+            gains["P_rate_rp"] = float(os.environ.get("MICRO502_P_RATE_RP", gains["P_rate_rp"]))
+            gains["D_rate_rp"] = float(os.environ.get("MICRO502_D_RATE_RP", gains["D_rate_rp"]))
+            self.limits["L_vel_xy"] = float(os.environ.get("MICRO502_L_VEL_XY", "2.5"))
+            self.limits["L_acc_rp"] = float(os.environ.get("MICRO502_L_ACC_RP", "0.5235987756"))
+            self.limits["L_rate_rp"] = float(os.environ.get("MICRO502_L_RATE_RP", "2.0"))
                 
         self.global_time = 0
         self.mass = 0.0552 #[kg]
+        self.trajectory_velocity_ff_scale = 0.0
+        self.trajectory_acceleration_ff_scale = 0.0
+        if exp_num == 4:
+            self.trajectory_velocity_ff_scale = float(os.environ.get("MICRO502_TRAJ_VEL_FF_SCALE", "0.0"))
+            self.trajectory_acceleration_ff_scale = float(os.environ.get("MICRO502_TRAJ_ACC_FF_SCALE", "0.0"))
 
         self.tuning_on = False
         self.tuning_start = 7
@@ -116,10 +134,20 @@ class quadrotor_controller():
 
 
     def setpoint_to_pwm(self, dt, setpoint, sensor_data):
+        setpoint = np.asarray(setpoint, dtype=float).flatten()
+        desired_velocity = np.zeros(3)
+        desired_acceleration = np.zeros(3)
+        if setpoint.size >= 7:
+            desired_velocity = self.trajectory_velocity_ff_scale * setpoint[4:7]
+        if setpoint.size >= 10:
+            desired_acceleration = self.trajectory_acceleration_ff_scale * setpoint[7:10]
+
         if self.tuning_level != "off":
             if self.init_pos is None:
                 self.init_pos = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], 0]
             setpoint = self.init_pos + np.array([0,0,0.75,0]) #Hover above initial position
+            desired_velocity = np.zeros(3)
+            desired_acceleration = np.zeros(3)
 
         ### START EXERCISE 1 SOLUTION ###
 
@@ -138,9 +166,9 @@ class quadrotor_controller():
         self.pid_pos_z.set_setpoint(setpoint[2])
 
         # Call PID controller
-        vel_x_setpoint_inertial = self.pid_pos_x.call(sensor_data["x_global"], dt=dt)
-        vel_y_setpoint_inertial = self.pid_pos_y.call(sensor_data["y_global"], dt=dt)
-        vel_z_setpoint_inertial = self.pid_pos_z.call(sensor_data["z_global"], dt=dt)
+        vel_x_setpoint_inertial = self.pid_pos_x.call(sensor_data["x_global"], dt=dt) + desired_velocity[0]
+        vel_y_setpoint_inertial = self.pid_pos_y.call(sensor_data["y_global"], dt=dt) + desired_velocity[1]
+        vel_z_setpoint_inertial = self.pid_pos_z.call(sensor_data["z_global"], dt=dt) + desired_velocity[2]
 
         # Calculate rotation
         R_current = R.from_quat([sensor_data["q_x"], sensor_data["q_y"], sensor_data["q_z"], sensor_data["q_w"]])
@@ -150,6 +178,7 @@ class quadrotor_controller():
         # Rotate velocity setpoint into body frame
         vel_setpoint_inertial = np.array([vel_x_setpoint_inertial, vel_y_setpoint_inertial, vel_z_setpoint_inertial])
         vel_setpoint = R_inertial_to_body @ vel_setpoint_inertial  # Rotate into body frame
+        acceleration_feedforward = R_inertial_to_body @ desired_acceleration
         
         # For tuning
         if self.tuning_level == "vel_xy":
@@ -163,9 +192,9 @@ class quadrotor_controller():
         self.pid_vel_z.set_setpoint(vel_setpoint[2])
         
         # Call PID controller (use sensor_data["v_forward"], sensor_data["v_left"], sensor_data["v_up"])
-        acc_x_setpoint = self.pid_vel_x.call(sensor_data["v_forward"], dt=dt)
-        acc_y_setpoint = self.pid_vel_y.call(sensor_data["v_left"], dt=dt)
-        acc_z_setpoint = self.pid_vel_z.call(sensor_data["v_up"], dt=dt)
+        acc_x_setpoint = self.pid_vel_x.call(sensor_data["v_forward"], dt=dt) + acceleration_feedforward[0] / 9.81
+        acc_y_setpoint = self.pid_vel_y.call(sensor_data["v_left"], dt=dt) + acceleration_feedforward[1] / 9.81
+        acc_z_setpoint = self.pid_vel_z.call(sensor_data["v_up"], dt=dt) + acceleration_feedforward[2]
 
         yaw_setpoint = setpoint[3]
         return self.acceleration_and_yaw_to_pwm(dt, [acc_x_setpoint, acc_y_setpoint, acc_z_setpoint], yaw_setpoint, sensor_data)
@@ -188,8 +217,8 @@ class quadrotor_controller():
             yaw = self.tuning(-2,2,2,dt,yaw, sensor_data["yaw"], "yaw [rad]")
 
         # Attitude control loop
-        self.pid_att_x.set_setpoint(np.clip(-acceleration[1],-np.pi/6,np.pi/6))
-        self.pid_att_y.set_setpoint(np.clip(acceleration[0],-np.pi/6,np.pi/6))
+        self.pid_att_x.set_setpoint(np.clip(-acceleration[1], -self.limits["L_acc_rp"], self.limits["L_acc_rp"]))
+        self.pid_att_y.set_setpoint(np.clip(acceleration[0], -self.limits["L_acc_rp"], self.limits["L_acc_rp"]))
         yaw = self.convert_yaw_setpoint(yaw, sensor_data["yaw"])
         self.pid_att_z.set_setpoint(yaw)
         

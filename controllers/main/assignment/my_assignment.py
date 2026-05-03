@@ -26,8 +26,11 @@ class MyAssignment:
         self.camera_offset_body = np.array([0.03, 0.0, 0.01])
         self.opening_height = 0.40
         self.assumed_gate_width = 0.40
-        self.replay_speed_limit = 1.85
-        self.replay_accel_limit = 6.50
+        self.replay_speed_limit = float(os.environ.get("MICRO502_REPLAY_SPEED_LIMIT", "2.20"))
+        self.replay_accel_limit = float(os.environ.get("MICRO502_REPLAY_ACCEL_LIMIT", "5.00"))
+        self.replay_timing_speed = float(os.environ.get("MICRO502_REPLAY_TIMING_SPEED", "4.50"))
+        self.replay_min_segment_time = float(os.environ.get("MICRO502_REPLAY_MIN_SEGMENT_TIME", "0.12"))
+        self.replay_max_segment_time = float(os.environ.get("MICRO502_REPLAY_MAX_SEGMENT_TIME", "2.00"))
         self.replay_waypoint_tolerance = 0.035
         self.replay_min_width_margin = 0.090
         self.replay_min_height_margin = 0.120
@@ -290,7 +293,18 @@ class MyAssignment:
 
         self.stage = "stored_replay"
         yaw_target = math.atan2(velocity[1], velocity[0]) if np.linalg.norm(velocity[:2]) > 0.03 else yaw
-        return [float(target[0]), float(target[1]), float(target[2]), float(self._wrap_angle(yaw_target))]
+        return [
+            float(target[0]),
+            float(target[1]),
+            float(target[2]),
+            float(self._wrap_angle(yaw_target)),
+            float(velocity[0]),
+            float(velocity[1]),
+            float(velocity[2]),
+            float(acceleration[0]),
+            float(acceleration[1]),
+            float(acceleration[2]),
+        ]
 
     def _return_to_start_or_next_lap(self, now, pos, lap_after_return):
         self.phase = "return_to_start"
@@ -1565,7 +1579,13 @@ class MyAssignment:
         times = [0.0]
         for idx in range(1, len(waypoints)):
             distance = float(np.linalg.norm(waypoints[idx] - waypoints[idx - 1]))
-            segment_time = float(np.clip(distance / 0.72, 0.80, 3.80))
+            segment_time = float(
+                np.clip(
+                    distance / self.replay_timing_speed,
+                    self.replay_min_segment_time,
+                    self.replay_max_segment_time,
+                )
+            )
             times.append(times[-1] + segment_time)
         return np.asarray(times, dtype=float)
 
