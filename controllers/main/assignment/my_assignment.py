@@ -217,10 +217,21 @@ class MyAssignment:
         self.stage = "stored_exit"
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
         exit_error = np.linalg.norm(pos - exit_point)
-        if progress > 0.76 or (exit_error < 0.24 and progress > 0.58):
+        segment = self._segment_from_position(pos[:2])
+        crossed_expected_segment = segment == self.gate_idx + 1
+        done_reason = None
+        if progress > 0.76:
+            done_reason = "clear_progress"
+        elif crossed_expected_segment and progress > 0.42:
+            done_reason = "next_segment"
+        elif exit_error < 0.28 and progress > 0.50:
+            done_reason = "near_exit"
+
+        if done_reason is not None:
             self._log(
                 f"stored_gate_done lap={self.route_lap} gate={self.gate_idx} "
-                f"progress={progress:.2f} exit_error={exit_error:.2f}"
+                f"reason={done_reason} progress={progress:.2f} "
+                f"exit_error={exit_error:.2f} segment={segment}"
             )
             self.gate_idx += 1
             self.stored_stage = "entry"
@@ -505,8 +516,21 @@ class MyAssignment:
         self.stage = "pass_exit"
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
         exit_error = np.linalg.norm(pos - exit_point)
-        if progress > 0.68 or (exit_error < 0.24 and progress > 0.52):
-            self._log(f"pass_done lap=0 gate={gate_idx} progress={progress:.2f} exit_error={exit_error:.2f}")
+        segment = self._segment_from_position(pos[:2])
+        crossed_expected_segment = segment == gate_idx + 1
+        done_reason = None
+        if progress > 0.68:
+            done_reason = "clear_progress"
+        elif crossed_expected_segment and progress > 0.42:
+            done_reason = "next_segment"
+        elif exit_error < 0.28 and progress > 0.46:
+            done_reason = "near_exit"
+
+        if done_reason is not None:
+            self._log(
+                f"pass_done lap=0 gate={gate_idx} reason={done_reason} "
+                f"progress={progress:.2f} exit_error={exit_error:.2f} segment={segment}"
+            )
             self.gate_idx += 1
             self.stage = "search"
             self.pass_stage = "center"
