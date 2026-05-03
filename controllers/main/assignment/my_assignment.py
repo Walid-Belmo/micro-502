@@ -54,19 +54,30 @@ class MyAssignment:
         self.last_detection = None
 
         base_dir = Path(__file__).resolve().parent
-        self.debug_enabled = os.environ.get("MICRO502_DEBUG", "1") != "0"
-        self.save_images = os.environ.get("MICRO502_SAVE_IMAGES", "1") != "0"
+        self.debug_enabled = os.environ.get("MICRO502_DEBUG", "0") != "0"
+        self.save_images = os.environ.get("MICRO502_SAVE_IMAGES", "0") != "0"
+        self.debug_stdout = os.environ.get("MICRO502_DEBUG_STDOUT", "0") != "0"
+        self.run_id = os.environ.get("MICRO502_RUN_ID", time.strftime("%Y%m%d_%H%M%S"))
+        self.layout_id = os.environ.get("MICRO502_RANDOM_SEED", "unknown")
         self.debug_dir = base_dir / "debug"
         self.log_path = self.debug_dir / "assignment_debug.log"
         self.start_wall = time.time()
+        self.log_seq = 0
         self.last_log_time = -1e9
         self.last_image_time = -1e9
         self.image_count = 0
+        self.last_state_tuple = None
+        self.last_throttled_log = {}
 
         if self.debug_enabled:
             self.debug_dir.mkdir(exist_ok=True)
             self.log_path.write_text("", encoding="utf-8")
-        self._log("init course_strategy gate_pose_first_lap entry_center_exit")
+        self._log(
+            "init "
+            f"run_id={self.run_id} layout_id={self.layout_id} "
+            "course_strategy=first_lap_detect_then_reuse "
+            f"debug_enabled={self.debug_enabled} save_images={self.save_images}"
+        )
 
     def compute_command(self, sensor_data, camera_data, dt):
         now = float(sensor_data.get("t", 0.0))
@@ -74,11 +85,19 @@ class MyAssignment:
         yaw = float(sensor_data["yaw"])
 
         detection = self._detect_gate(camera_data)
+        raw_detection = detection
         if (
             detection is not None
             and self.gate_idx < self.num_gates
             and (not self.started_course or not self._detection_matches_gate(sensor_data, detection, camera_data.shape, self.gate_idx))
         ):
+            reason = "course_not_started" if not self.started_course else "does_not_match_expected_gate"
+            self._log_throttled(
+                f"reject_detection_gate_{self.gate_idx}_{reason}",
+                now,
+                0.75,
+                f"detection_rejected gate={self.gate_idx} reason={reason} det={self._det_summary(raw_detection)}",
+            )
             detection = None
 
         if (
@@ -93,15 +112,22 @@ class MyAssignment:
             self._update_gate_estimate(self.gate_idx, sensor_data, detection, camera_data.shape)
             self._save_debug_image(camera_data, detection, now)
 
-        command = self._compute_course_command(now, pos, yaw, sensor_data, detection)
+        image_shape = camera_data.shape if camera_data is not None else (300, 300, 4)
+        command = self._compute_course_command(now, pos, yaw, sensor_data, detection, image_shape)
         self._log_status(now, pos, yaw, detection, command)
         return command
 
-    def _compute_course_command(self, now, pos, yaw, sensor_data, detection):
+    def _compute_course_command(self, now, pos, yaw, sensor_data, detection, image_shape):
         if not self.started_course:
             if pos[2] < 1.05 or now < 2.0:
                 self.phase = "takeoff"
                 self.stage = "climb"
+                self._log_throttled(
+                    "takeoff_climb",
+                    now,
+                    1.0,
+                    f"takeoff_climb pos={self._vec(pos)} target={self._vec(self.takeoff_pos)}",
+                )
                 return self._limited_setpoint(
                     pos,
                     self.takeoff_pos,
@@ -109,11 +135,18 @@ class MyAssignment:
                     yaw_target=self._expected_pass_yaw(0),
                 )
             self.started_course = True
+            self._log(f"course_started t={now:.2f} pos={self._vec(pos)} yaw={yaw:.3f}")
 
         if pos[2] < 0.62:
             self.phase = "takeoff"
             self.stage = "altitude_recovery"
             recovery = np.array([pos[0], pos[1], 1.15])
+            self._log_throttled(
+                "altitude_recovery",
+                now,
+                0.75,
+                f"altitude_recovery pos={self._vec(pos)} target={self._vec(recovery)} yaw={yaw:.3f}",
+            )
             return self._limited_setpoint(
                 pos,
                 recovery,
@@ -122,16 +155,16 @@ class MyAssignment:
             )
 
         if self.route_lap == 0:
-            return self._first_lap_command(now, pos, yaw, sensor_data, detection)
+            return self._first_lap_command(now, pos, yaw, sensor_data, detection, image_shape)
 
         if self.route_lap <= 2:
-            return self._stored_lap_command(now, pos, yaw, sensor_data, detection)
+            return self._stored_lap_command(now, pos, yaw, sensor_data, detection, image_shape)
 
         self.phase = "done"
         self.stage = "hold"
         return self._limited_setpoint(pos, self.takeoff_pos, max_step=0.35, yaw_target=yaw)
 
-    def _first_lap_command(self, now, pos, yaw, sensor_data, detection):
+    def _first_lap_command(self, now, pos, yaw, sensor_data, detection, image_shape):
         self.phase = "vision_lap"
 
         if self.gate_idx >= self.num_gates:
@@ -146,12 +179,12 @@ class MyAssignment:
 
         self.stage = "vision_servo"
         if self._ready_to_commit(pos, detection):
-            if self._start_first_lap_commit(now, pos, yaw, detection):
+            if self._start_first_lap_commit(now, pos, yaw, sensor_data, detection, image_shape):
                 return self._gate_pass_command(now, pos, first_lap=True, detection=detection)
 
         return self._vision_servo_command(pos, yaw, detection)
 
-    def _stored_lap_command(self, now, pos, yaw, sensor_data, detection):
+    def _stored_lap_command(self, now, pos, yaw, sensor_data, detection, image_shape):
         self.phase = f"stored_lap_{self.route_lap}"
 
         if self.gate_idx >= self.num_gates:
@@ -162,7 +195,7 @@ class MyAssignment:
             self.stage = "fallback_search"
             return self._search_command(now, pos, self.gate_idx)
 
-        gate = gate.copy()
+        gate = self._correct_stored_gate_from_vision(now, pos, sensor_data, detection, image_shape, gate.copy())
         entry, center, exit_point, pass_dir, pass_yaw = self._gate_waypoints(self.gate_idx, gate)
 
         if self.stored_stage == "entry":
@@ -183,13 +216,17 @@ class MyAssignment:
 
         self.stage = "stored_exit"
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
-        if progress > 0.46 or np.linalg.norm(pos - exit_point) < 0.22:
-            self._log(f"stored_gate_done lap={self.route_lap} gate={self.gate_idx} progress={progress:.2f}")
+        exit_error = np.linalg.norm(pos - exit_point)
+        if progress > 0.76 or (exit_error < 0.24 and progress > 0.58):
+            self._log(
+                f"stored_gate_done lap={self.route_lap} gate={self.gate_idx} "
+                f"progress={progress:.2f} exit_error={exit_error:.2f}"
+            )
             self.gate_idx += 1
             self.stored_stage = "entry"
-            return self._stored_lap_command(now, pos, yaw, sensor_data, detection)
+            return self._stored_lap_command(now, pos, yaw, sensor_data, detection, image_shape)
 
-        return self._limited_setpoint(pos, exit_point, max_step=0.42, yaw_target=pass_yaw)
+        return self._limited_setpoint(pos, exit_point, max_step=0.38, yaw_target=pass_yaw)
 
     def _return_to_start_or_next_lap(self, now, pos, lap_after_return):
         self.phase = "return_to_start"
@@ -216,7 +253,7 @@ class MyAssignment:
         if self.search_gate_idx != gate_idx:
             self.search_gate_idx = gate_idx
             self.search_started_at = now
-            self._log(f"search_start gate={gate_idx}")
+            self._log(f"search_start gate={gate_idx} expected={self._vec(self._expected_gate_position(gate_idx))}")
 
         expected_gate = self._expected_gate_position(gate_idx)
         pass_dir = self._pass_direction_for_gate(gate_idx, expected_gate)
@@ -229,13 +266,31 @@ class MyAssignment:
             standoff = estimate - 0.55 * self._pass_direction_for_gate(gate_idx, estimate, pos)
             standoff[2] = np.clip(estimate[2], 0.75, 2.05)
             pass_yaw = self._yaw_to_point(pos, estimate)
+            self._log_throttled(
+                f"search_using_recent_estimate_{gate_idx}",
+                now,
+                0.75,
+                f"search_using_recent_estimate gate={gate_idx} estimate={self._vec(estimate)} standoff={self._vec(standoff)}",
+            )
 
         dist_to_standoff = np.linalg.norm(pos[:2] - standoff[:2])
         if dist_to_standoff > 0.32:
+            self._log_throttled(
+                f"search_move_to_standoff_{gate_idx}",
+                now,
+                1.0,
+                f"search_move_to_standoff gate={gate_idx} dist={dist_to_standoff:.2f} target={self._vec(standoff)} yaw={pass_yaw:.3f}",
+            )
             return self._limited_setpoint(pos, standoff, max_step=0.50, yaw_target=pass_yaw)
 
         scan = 0.70 * math.sin(0.55 * (now - self.search_started_at))
         yaw_target = self._wrap_angle(pass_yaw + scan)
+        self._log_throttled(
+            f"search_scan_{gate_idx}",
+            now,
+            1.0,
+            f"search_scan gate={gate_idx} standoff={self._vec(standoff)} yaw={yaw_target:.3f} scan={scan:.3f}",
+        )
         return self._limited_setpoint(pos, standoff, max_step=0.18, yaw_target=yaw_target)
 
     def _vision_servo_command(self, pos, yaw, detection):
@@ -257,12 +312,24 @@ class MyAssignment:
                 center_target[:2] += 0.04 * pass_dir[:2]
                 center_target[2] = np.clip(pos[2] - np.clip(0.16 * err_y, -0.05, 0.05), 0.70, 2.05)
                 yaw_target = self._yaw_to_point(pos, gate)
+                self._log_throttled(
+                    f"vision_servo_center_{self.gate_idx}",
+                    float("inf"),
+                    0.0,
+                    f"vision_servo_center gate={self.gate_idx} det={self._det_summary(detection)} target={self._vec(center_target)}",
+                )
                 return self._limited_setpoint(pos, center_target, max_step=0.16, yaw_target=yaw_target)
 
             entry[:2] += np.clip(0.12 * err_x, -0.07, 0.07) * right
             entry[2] = np.clip(gate[2] - 0.16 * err_y, 0.70, 2.05)
             yaw_target = self._yaw_to_point(pos, gate)
             max_step = 0.34 if dist_entry > 0.45 else 0.18
+            self._log_throttled(
+                f"vision_servo_entry_{self.gate_idx}",
+                float("inf"),
+                0.0,
+                f"vision_servo_entry gate={self.gate_idx} dist_entry={dist_entry:.2f} det={self._det_summary(detection)} target={self._vec(entry)}",
+            )
             return self._limited_setpoint(pos, entry, max_step=max_step, yaw_target=yaw_target)
 
         yaw_cmd = self._wrap_angle(yaw - 0.35 * err_x)
@@ -283,28 +350,90 @@ class MyAssignment:
         target_xy = pos[:2] + forward_step * forward + lateral_step * right
         z_target = np.clip(pos[2] - np.clip(0.18 * err_y, -0.06, 0.06), 0.70, 2.05)
         target = np.array([target_xy[0], target_xy[1], z_target])
+        self._log_throttled(
+            f"vision_servo_no_estimate_{self.gate_idx}",
+            float("inf"),
+            0.0,
+            f"vision_servo_no_estimate gate={self.gate_idx} det={self._det_summary(detection)} target={self._vec(target)} yaw={yaw_cmd:.3f}",
+        )
         return [float(target[0]), float(target[1]), float(target[2]), float(yaw_cmd)]
 
     def _ready_to_commit(self, pos, detection):
         if self.gate_idx >= self.num_gates or self.gate_estimates[self.gate_idx] is None:
+            self._log_throttled(
+                f"commit_not_ready_no_estimate_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=no_estimate det={self._det_summary(detection)}",
+            )
             return False
         if not self._is_full_gate_detection(detection):
+            self._log_throttled(
+                f"commit_not_ready_partial_detection_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=partial_detection det={self._det_summary(detection)}",
+            )
             return False
 
         gate = self.gate_estimates[self.gate_idx]
         pass_dir = self._pass_direction_for_gate(self.gate_idx, gate, pos)
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
         if progress > 0.20:
+            self._log_throttled(
+                f"commit_not_ready_already_past_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=already_past progress={progress:.2f} gate={self._vec(gate)} det={self._det_summary(detection)}",
+            )
             return False
 
         err_x = abs(detection["err_x"])
         err_y = abs(detection["err_y"])
         area = detection["area"]
         _, _, bw, bh = detection["bbox"]
-        return err_x < 0.18 and err_y < 0.20 and area > 850 and bh > 34 and bw > 24
+        ready = err_x < 0.18 and err_y < 0.20 and area > 850 and bh > 34 and bw > 24
+        if ready:
+            self._log(
+                f"commit_ready gate={self.gate_idx} progress={progress:.2f} "
+                f"gate={self._vec(gate)} det={self._det_summary(detection)}"
+            )
+        else:
+            self._log_throttled(
+                f"commit_not_ready_thresholds_{self.gate_idx}",
+                float("inf"),
+                0.75,
+                f"commit_not_ready gate={self.gate_idx} reason=thresholds progress={progress:.2f} "
+                f"err=({err_x:.2f},{err_y:.2f}) area={area:.0f} bbox=({bw},{bh})",
+            )
+        return ready
 
-    def _start_first_lap_commit(self, now, pos, yaw, detection):
+    def _start_first_lap_commit(self, now, pos, yaw, sensor_data, detection, image_shape):
         gate = self.gate_estimates[self.gate_idx]
+        visual_gate, visual_reason = self._current_visual_gate_estimate(
+            self.gate_idx,
+            sensor_data,
+            detection,
+            image_shape,
+            require_full=True,
+        )
+        if visual_gate is not None:
+            if gate is None:
+                gate = visual_gate
+                self._log(f"commit_visual_estimate gate={self.gate_idx} gate={self._vec(gate)} reason={visual_reason}")
+            else:
+                shift = np.linalg.norm(gate[:2] - visual_gate[:2])
+                if shift > 0.18:
+                    self._log(
+                        f"commit_recenter_from_vision gate={self.gate_idx} "
+                        f"old={self._vec(gate)} visual={self._vec(visual_gate)} shift={shift:.2f}"
+                    )
+                gate = visual_gate
+        else:
+            self._log(
+                f"commit_no_visual_recenter gate={self.gate_idx} "
+                f"reason={visual_reason} current={self._vec(gate)}"
+            )
         if gate is None:
             gate = self._monocular_gate_estimate(pos, yaw, detection, (300, 300, 4))
             gate = self._sanitize_gate_estimate(self.gate_idx, gate)
@@ -351,6 +480,7 @@ class MyAssignment:
         if self.pass_stage == "entry":
             self.stage = "pass_entry"
             if np.linalg.norm(pos - entry) < 0.22:
+                self._log(f"pass_entry_reached lap=0 gate={gate_idx} pos={self._vec(pos)} entry={self._vec(entry)}")
                 self.pass_stage = "center"
             else:
                 return self._limited_setpoint(pos, entry, max_step=0.32, yaw_target=pass_yaw)
@@ -375,8 +505,8 @@ class MyAssignment:
         self.stage = "pass_exit"
         progress = float(np.dot(pos[:2] - gate[:2], pass_dir[:2]))
         exit_error = np.linalg.norm(pos - exit_point)
-        if progress > 0.45 or (exit_error < 0.22 and progress > 0.20):
-            self._log(f"pass_done lap=0 gate={gate_idx} progress={progress:.2f}")
+        if progress > 0.68 or (exit_error < 0.24 and progress > 0.52):
+            self._log(f"pass_done lap=0 gate={gate_idx} progress={progress:.2f} exit_error={exit_error:.2f}")
             self.gate_idx += 1
             self.stage = "search"
             self.pass_stage = "center"
@@ -400,10 +530,22 @@ class MyAssignment:
 
     def _update_gate_estimate(self, gate_idx, sensor_data, detection, image_shape):
         if not self._is_usable_detection(detection):
+            self._log_throttled(
+                f"estimate_skip_unusable_detection_{gate_idx}",
+                float(sensor_data.get("t", 0.0)),
+                0.75,
+                f"estimate_skip gate={gate_idx} reason=unusable_detection det={self._det_summary(detection)}",
+            )
             return
 
         now = float(sensor_data.get("t", 0.0))
         if now - self.last_observation_time[gate_idx] < 0.12:
+            self._log_throttled(
+                f"estimate_skip_too_soon_{gate_idx}",
+                now,
+                0.75,
+                f"estimate_skip gate={gate_idx} reason=too_soon dt={now - self.last_observation_time[gate_idx]:.3f}",
+            )
             return
         self.last_observation_time[gate_idx] = now
 
@@ -413,26 +555,106 @@ class MyAssignment:
             observations.append((camera_pos, ray_dir))
             if len(observations) > 12:
                 observations.pop(0)
+            self._log(
+                f"observation_added gate={gate_idx} count={len(observations)} "
+                f"camera={self._vec(camera_pos)} ray={self._vec(ray_dir)} det={self._det_summary(detection)}"
+            )
 
-        mono = self._sanitize_gate_estimate(
-            gate_idx,
-            self._monocular_gate_estimate_from_ray(camera_pos, ray_dir, detection),
-        )
-        tri = self._sanitize_gate_estimate(gate_idx, self._triangulate_rays(observations))
-        candidate = tri if tri is not None else mono
+        mono_raw = self._monocular_gate_estimate_from_ray(camera_pos, ray_dir, detection)
+        mono, mono_reason = self._sanitize_gate_estimate_with_reason(gate_idx, mono_raw)
+        tri_raw = self._triangulate_rays(observations)
+        tri, tri_reason = self._sanitize_gate_estimate_with_reason(gate_idx, tri_raw)
+        candidate = mono
+        source = "monocular"
+        if mono is not None and tri is not None:
+            disagreement = np.linalg.norm(mono[:2] - tri[:2])
+            if disagreement <= 0.35:
+                candidate = 0.65 * mono + 0.35 * tri
+                source = "mono_tri_agree"
+            else:
+                self._log_throttled(
+                    f"estimate_ignore_triangulation_{gate_idx}",
+                    now,
+                    0.5,
+                    f"estimate_ignore_triangulation gate={gate_idx} disagreement={disagreement:.2f} "
+                    f"mono={self._vec(mono)} tri={self._vec(tri)}",
+                )
+        elif tri is not None:
+            candidate = tri
+            source = "triangulated_fallback"
         if candidate is None:
+            self._log_throttled(
+                f"estimate_reject_candidate_{gate_idx}",
+                now,
+                0.5,
+                f"estimate_reject gate={gate_idx} mono_raw={self._vec(mono_raw)} mono_reason={mono_reason} "
+                f"tri_raw={self._vec(tri_raw)} tri_reason={tri_reason} observations={len(observations)}",
+            )
             return
 
         old = self.gate_estimates[gate_idx]
         if old is None:
             estimate = candidate
         elif np.linalg.norm(old[:2] - candidate[:2]) > 0.80:
+            self._log(
+                f"estimate_reject gate={gate_idx} reason=jump_too_large "
+                f"old={self._vec(old)} candidate={self._vec(candidate)} jump={np.linalg.norm(old[:2] - candidate[:2]):.2f}"
+            )
             return
         else:
             estimate = 0.72 * old + 0.28 * candidate
         estimate[2] = np.clip(estimate[2], 0.70, 2.05)
         self.gate_estimates[gate_idx] = estimate
         self.estimate_samples[gate_idx] += 1
+        self._log(
+            f"estimate_accept gate={gate_idx} source={source} samples={self.estimate_samples[gate_idx]} "
+            f"estimate={self._vec(estimate)} candidate={self._vec(candidate)} mono_reason={mono_reason} tri_reason={tri_reason}"
+        )
+
+    def _current_visual_gate_estimate(self, gate_idx, sensor_data, detection, image_shape, require_full):
+        if detection is None:
+            return None, "no_detection"
+        if require_full and not self._is_full_gate_detection(detection):
+            return None, "not_full_detection"
+        if not require_full and not self._is_usable_detection(detection):
+            return None, "not_usable_detection"
+
+        camera_pos, ray_dir = self._camera_ray(sensor_data, detection, image_shape)
+        mono_raw = self._monocular_gate_estimate_from_ray(camera_pos, ray_dir, detection)
+        mono, mono_reason = self._sanitize_gate_estimate_with_reason(gate_idx, mono_raw)
+        if mono is None:
+            return None, mono_reason
+        return mono, "accepted"
+
+    def _correct_stored_gate_from_vision(self, now, pos, sensor_data, detection, image_shape, gate):
+        visual_gate, reason = self._current_visual_gate_estimate(
+            self.gate_idx,
+            sensor_data,
+            detection,
+            image_shape,
+            require_full=True,
+        )
+        if visual_gate is None:
+            self._log_throttled(
+                f"stored_visual_no_correction_{self.gate_idx}",
+                now,
+                0.75,
+                f"stored_visual_no_correction lap={self.route_lap} gate={self.gate_idx} reason={reason} det={self._det_summary(detection)}",
+            )
+            return gate
+
+        shift = np.linalg.norm(gate[:2] - visual_gate[:2])
+        if shift < 0.10:
+            return gate
+
+        corrected = visual_gate.copy()
+        self.gate_estimates[self.gate_idx] = corrected
+        self._learn_pass_direction(self.gate_idx, corrected, pos)
+        self._log(
+            f"stored_visual_correction lap={self.route_lap} gate={self.gate_idx} "
+            f"old={self._vec(gate)} visual={self._vec(visual_gate)} shift={shift:.2f}"
+        )
+        return corrected
 
     def _detection_matches_gate(self, sensor_data, detection, image_shape, gate_idx):
         if not self._is_usable_detection(detection):
@@ -574,32 +796,36 @@ class MyAssignment:
         return point
 
     def _sanitize_gate_estimate(self, gate_idx, estimate):
+        sanitized, _ = self._sanitize_gate_estimate_with_reason(gate_idx, estimate)
+        return sanitized
+
+    def _sanitize_gate_estimate_with_reason(self, gate_idx, estimate):
         if estimate is None or not np.all(np.isfinite(estimate)):
-            return None
+            return None, "missing_or_nonfinite"
 
         estimate = np.asarray(estimate, dtype=float).copy()
         rel = estimate[:2] - self.center
         radius = np.linalg.norm(rel)
         if radius < 1e-6:
-            return None
+            return None, "at_course_center"
 
         expected = self._expected_angle(gate_idx)
         angle = self._angle_from_position(estimate[:2])
         if abs(self._angle_diff(angle, expected)) > 0.34:
-            return None
+            return None, f"wrong_angle angle={angle:.3f} expected={expected:.3f}"
         if self._segment_from_position(estimate[:2]) != gate_idx + 1:
-            return None
+            return None, f"wrong_segment segment={self._segment_from_position(estimate[:2])} expected={gate_idx + 1}"
         if radius < self.inner_radius - 0.45 or radius > self.outer_radius + 0.55:
-            return None
+            return None, f"radius_out_of_range radius={radius:.2f}"
         for prev_idx in range(gate_idx):
             prev = self.gate_estimates[prev_idx]
             if prev is not None and np.linalg.norm(estimate[:2] - prev[:2]) < 0.72:
-                return None
+                return None, f"too_close_to_previous_gate prev={prev_idx}"
 
         estimate[0] = np.clip(estimate[0], 0.25, 7.75)
         estimate[1] = np.clip(estimate[1], 0.25, 7.75)
         estimate[2] = np.clip(estimate[2], 0.70, 2.05)
-        return estimate
+        return estimate, "accepted"
 
     def _limited_setpoint(self, pos, target, max_step, yaw_target):
         target = np.asarray(target, dtype=float).copy()
@@ -689,10 +915,12 @@ class MyAssignment:
         tangent = self._geometric_pass_direction_for_gate(gate_idx, gate_estimate)
         to_gate = np.asarray(gate_estimate)[:2] - np.asarray(pos)[:2]
         norm = np.linalg.norm(to_gate)
+        source = "tangent"
         if norm > 1e-6:
             approach = np.array([to_gate[0] / norm, to_gate[1] / norm, 0.0])
             if np.dot(approach[:2], tangent[:2]) > 0.35:
                 direction = approach
+                source = "approach"
             else:
                 direction = tangent
         else:
@@ -704,6 +932,11 @@ class MyAssignment:
             direction /= np.linalg.norm(direction[:2])
 
         self.gate_pass_directions[gate_idx] = direction.copy()
+        self._log(
+            f"pass_direction_learned gate={gate_idx} source={source} "
+            f"gate={self._vec(gate_estimate)} pos={self._vec(pos)} "
+            f"tangent={self._vec(tangent)} direction={self._vec(direction)}"
+        )
         return direction
 
     def _gate_waypoints(self, gate_idx, gate_estimate):
@@ -718,7 +951,7 @@ class MyAssignment:
 
         center = gate.copy()
         entry = gate - 0.58 * pass_dir
-        exit_point = gate + 0.62 * pass_dir
+        exit_point = gate + 0.88 * pass_dir
         for point in (entry, center, exit_point):
             point[2] = np.clip(gate[2], 0.74, 2.05)
 
@@ -786,23 +1019,35 @@ class MyAssignment:
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
     def _log_status(self, now, pos, yaw, detection, command):
+        state_tuple = (
+            self.route_lap,
+            self.gate_idx,
+            self.phase,
+            self.stage,
+            self.pass_stage,
+            self.stored_stage,
+            self.commit_gate_idx,
+        )
+        if state_tuple != self.last_state_tuple:
+            self._log(
+                f"state_change t={now:.2f} own_lap={self.route_lap} gate={self.gate_idx} "
+                f"phase={self.phase} stage={self.stage} pass_stage={self.pass_stage} "
+                f"stored_stage={self.stored_stage} commit_gate={self.commit_gate_idx} "
+                f"pos={self._vec(pos)} yaw={yaw:.3f}"
+            )
+            self.last_state_tuple = state_tuple
+
         if not self.debug_enabled or now - self.last_log_time < 0.5:
             return
         self.last_log_time = now
-        det_txt = "none"
-        if detection is not None:
-            det_txt = (
-                f"area={detection['area']:.0f} "
-                f"err=({detection['err_x']:.2f},{detection['err_y']:.2f}) "
-                f"bbox={detection['bbox']}"
-            )
         estimates = "".join("." if p is None else "x" for p in self.gate_estimates)
         self._log(
             f"t={now:.2f} phase={self.phase} stage={self.stage} own_lap={self.route_lap} "
             f"gate={self.gate_idx} seg={self._segment_from_position(pos[:2])} "
             f"pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f}) yaw={yaw:.2f} "
             f"cmd=({command[0]:.2f},{command[1]:.2f},{command[2]:.2f},{command[3]:.2f}) "
-            f"det={det_txt} estimates={estimates} samples={self.estimate_samples}"
+            f"det={self._det_summary(detection)} estimates={estimates} samples={self.estimate_samples} "
+            f"pass_dirs={self._pass_dir_summary()}"
         )
 
     def _save_debug_image(self, camera_data, detection, now):
@@ -822,12 +1067,57 @@ class MyAssignment:
         cv2.line(image, (0, 150), (300, 150), (255, 255, 255), 1)
         cv2.imwrite(str(self.debug_dir / f"camera_{self.image_count:03d}_{now:.1f}.png"), image)
         cv2.imwrite(str(self.debug_dir / f"mask_{self.image_count:03d}_{now:.1f}.png"), detection["mask"])
+        self._log(
+            f"debug_image_saved index={self.image_count} t={now:.2f} "
+            f"camera=camera_{self.image_count:03d}_{now:.1f}.png mask=mask_{self.image_count:03d}_{now:.1f}.png "
+            f"det={self._det_summary(detection)}"
+        )
+
+    def _vec(self, value):
+        if value is None:
+            return "None"
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        return "(" + ",".join(f"{x:.3f}" for x in arr[:3]) + ")"
+
+    def _det_summary(self, detection):
+        if detection is None:
+            return "none"
+        x, y, bw, bh = detection["bbox"]
+        return (
+            f"area={detection['area']:.0f} score={detection.get('score', 0.0):.0f} "
+            f"err=({detection['err_x']:.2f},{detection['err_y']:.2f}) "
+            f"bbox=({x},{y},{bw},{bh}) fill={detection.get('fill', 0.0):.2f} "
+            f"edge={detection.get('touches_edge', False)}"
+        )
+
+    def _pass_dir_summary(self):
+        parts = []
+        for idx, direction in enumerate(self.gate_pass_directions):
+            if direction is None:
+                parts.append(f"{idx}:.")
+            else:
+                parts.append(f"{idx}:({direction[0]:.2f},{direction[1]:.2f})")
+        return "[" + " ".join(parts) + "]"
+
+    def _log_throttled(self, key, now, interval, message):
+        if not self.debug_enabled and not self.debug_stdout:
+            return
+        if not np.isfinite(now):
+            now = time.time() - self.start_wall
+        last = self.last_throttled_log.get(key, -1e9)
+        if now - last < interval:
+            return
+        self.last_throttled_log[key] = now
+        self._log(message)
 
     def _log(self, message):
-        print("ARDBG", message, flush=True)
+        self.log_seq += 1
+        line = f"seq={self.log_seq:06d} run_id={self.run_id} layout_id={self.layout_id} {message}"
+        if self.debug_stdout:
+            print("ARDBG", line, flush=True)
         if not self.debug_enabled:
             return
-        line = f"[{time.time() - self.start_wall:8.3f}] {message}"
+        line = f"[{time.time() - self.start_wall:8.3f}] {line}"
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 

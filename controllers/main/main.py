@@ -25,6 +25,7 @@ rand_env = True                # Randomise the environment
 debug_max_time = float(os.environ.get("MICRO502_MAX_TIME", "245") or 0)
 debug_sync_assignment = os.environ.get("MICRO502_SYNC_ASSIGNMENT", "1") != "0"
 debug_assignment_dir = os.path.join(os.path.dirname(__file__), "assignment", "debug")
+debug_random_seed = os.environ.get("MICRO502_RANDOM_SEED")
 
 # Global variables for handling threads
 latest_sensor_data = None
@@ -180,6 +181,11 @@ class CrazyflieInDroneDome(Supervisor):
         
             # Randomise the positions of the drone and gates
             if rand_env:
+                if debug_random_seed not in (None, ""):
+                    seed = int(debug_random_seed)
+                    random.seed(seed)
+                    np.random.seed(seed)
+                    print("DEBUG_RANDOM_SEED", seed, flush=True)
                 self.randomise_positions()
 
             # Get the position, size, and orientation of each of the gates
@@ -195,6 +201,16 @@ class CrazyflieInDroneDome(Supervisor):
             os.makedirs(os.path.dirname(self.score_log_path), exist_ok=True)
             with open(self.score_log_path, "w", encoding="utf-8") as score_log:
                 score_log.write("Webots simulator scoring log\n")
+                score_log.write(f"random_seed={debug_random_seed}\n")
+                for i, (gate_position, gate_size, gate_orientation) in enumerate(
+                    zip(self.gate_positions, self.gate_sizes, self.gate_orientations)
+                ):
+                    score_log.write(
+                        f"gate_truth {i} "
+                        f"pos=({gate_position[0]:.4f},{gate_position[1]:.4f},{gate_position[2]:.4f}) "
+                        f"size=({gate_size[0]:.4f},{gate_size[1]:.4f},{gate_size[2]:.4f}) "
+                        f"yaw={gate_orientation[3]:.4f}\n"
+                    )
             self.log_score("init")
 
     def log_score(self, event):

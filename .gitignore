@@ -141,3 +141,11 @@ map.png
 # Local controller debug output
 controllers/main/assignment/debug/
 
+# Generated validation output
+tools/generated_layout_logs/
+tools/generated_layout_results*.csv
+tools/validation_seeds.txt
+tools/run_seed_sweep.ps1
+tools/seed_sweep_logs/
+tools/seed_sweep_results.csv
+

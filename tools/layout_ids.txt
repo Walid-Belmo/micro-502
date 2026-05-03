@@ -1,0 +1,29 @@
+# Fixed generated layouts for local MICRO-502 validation.
+#
+# Each number is passed into the local simulator as the random generator input.
+# That makes Webots create the same gate layout every time for that number.
+#
+# The local simulator varies:
+# - gate angle inside its assigned course section
+# - gate radius from the center
+# - gate height
+# - gate opening width
+# - gate rotation
+#
+# Passing criterion:
+# Webots itself must count all 15 gate passes: 5 gates x 3 laps.
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
